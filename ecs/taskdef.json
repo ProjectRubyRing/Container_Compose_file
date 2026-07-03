@@ -1,0 +1,185 @@
+{
+  "family": "<APP_NAME>-<ENV>-task",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "2048",
+  "memory": "4096",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<APP_NAME>-<ENV>-task-role",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<APP_NAME>-<ENV>-task-execution-role",
+  "containerDefinitions": [
+    {
+      "name": "app-front",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/<APP_NAME>-front:<IMAGE_TAG>",
+      "essential": true,
+      "cpu": 768,
+      "memory": 1536,
+      "portMappings": [
+        { "containerPort": 8080, "protocol": "tcp", "name": "front-http" }
+      ],
+      "environment": [
+        { "name": "OTEL_SERVICE_NAME", "value": "<APP_NAME>-front" },
+        { "name": "OTEL_RESOURCE_ATTRIBUTES", "value": "service.namespace=<APP_NAME>,service.version=<IMAGE_TAG>,deployment.environment=<ENV>,aws.ecs.service.name=<ECS_SERVICE_NAME>" },
+        { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://127.0.0.1:4318" },
+        { "name": "OTEL_EXPORTER_OTLP_PROTOCOL", "value": "http/protobuf" },
+        { "name": "OTEL_PROPAGATORS", "value": "xray,tracecontext,baggage" },
+        { "name": "OTEL_TRACES_SAMPLER", "value": "parentbased_traceidratio" },
+        { "name": "OTEL_TRACES_SAMPLER_ARG", "value": "0.10" },
+        { "name": "OTEL_METRICS_EXPORTER", "value": "none" },
+        { "name": "OTEL_LOGS_EXPORTER", "value": "none" },
+        { "name": "DB_HOST", "value": "<RDS_PROXY_ENDPOINT>" },
+        { "name": "DB_PORT", "value": "3306" },
+        { "name": "DB_NAME", "value": "<DB_NAME>" },
+        { "name": "DB_USER", "value": "<DB_USER>" },
+        { "name": "VALKEY_HOST", "value": "<VALKEY_ENDPOINT>" },
+        { "name": "VALKEY_PORT", "value": "6379" },
+        { "name": "BACK_BASE_URL", "value": "http://127.0.0.1:8180" },
+        { "name": "TX_NODE_ID", "value": "<APP_NAME>-<ENV>-front" },
+        { "name": "JAVA_OPTS_APPEND", "value": "-Xms512m -Xmx1024m" }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/db/password"
+        }
+      ],
+      "dependsOn": [
+        { "containerName": "adot-collector", "condition": "HEALTHY" },
+        { "containerName": "app-back", "condition": "HEALTHY" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fs http://127.0.0.1:8080/ >/dev/null || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 120
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/<APP_NAME>/<ENV>/app-front",
+          "awslogs-region": "<AWS_REGION>",
+          "awslogs-stream-prefix": "front",
+          "awslogs-create-group": "true"
+        }
+      }
+    },
+    {
+      "name": "app-back",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/<APP_NAME>-back:<IMAGE_TAG>",
+      "essential": true,
+      "cpu": 768,
+      "memory": 1536,
+      "portMappings": [
+        { "containerPort": 8180, "protocol": "tcp", "name": "back-http" }
+      ],
+      "environment": [
+        { "name": "OTEL_SERVICE_NAME", "value": "<APP_NAME>-back" },
+        { "name": "OTEL_RESOURCE_ATTRIBUTES", "value": "service.namespace=<APP_NAME>,service.version=<IMAGE_TAG>,deployment.environment=<ENV>,aws.ecs.service.name=<ECS_SERVICE_NAME>" },
+        { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://127.0.0.1:4318" },
+        { "name": "OTEL_EXPORTER_OTLP_PROTOCOL", "value": "http/protobuf" },
+        { "name": "OTEL_PROPAGATORS", "value": "xray,tracecontext,baggage" },
+        { "name": "OTEL_TRACES_SAMPLER", "value": "parentbased_traceidratio" },
+        { "name": "OTEL_TRACES_SAMPLER_ARG", "value": "0.10" },
+        { "name": "OTEL_METRICS_EXPORTER", "value": "none" },
+        { "name": "OTEL_LOGS_EXPORTER", "value": "none" },
+        { "name": "PORT_OFFSET", "value": "100" },
+        { "name": "DB_HOST", "value": "<RDS_PROXY_ENDPOINT>" },
+        { "name": "DB_PORT", "value": "3306" },
+        { "name": "DB_NAME", "value": "<DB_NAME>" },
+        { "name": "DB_USER", "value": "<DB_USER>" },
+        { "name": "VALKEY_HOST", "value": "<VALKEY_ENDPOINT>" },
+        { "name": "VALKEY_PORT", "value": "6379" },
+        { "name": "SVF_BASE_URL", "value": "https://<REPORT_ALB_DNS_NAME>" },
+        { "name": "TX_NODE_ID", "value": "<APP_NAME>-<ENV>-back" },
+        { "name": "JAVA_OPTS_APPEND", "value": "-Xms512m -Xmx1024m" }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/db/password"
+        }
+      ],
+      "dependsOn": [
+        { "containerName": "adot-collector", "condition": "HEALTHY" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fs http://127.0.0.1:8180/ >/dev/null || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 120
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/<APP_NAME>/<ENV>/app-back",
+          "awslogs-region": "<AWS_REGION>",
+          "awslogs-stream-prefix": "back",
+          "awslogs-create-group": "true"
+        }
+      }
+    },
+    {
+      "name": "adot-collector",
+      "image": "public.ecr.aws/aws-observability/aws-otel-collector:v0.43.3",
+      "essential": true,
+      "cpu": 256,
+      "memory": 512,
+      "portMappings": [
+        { "containerPort": 4318, "protocol": "tcp", "name": "otlp-http" }
+      ],
+      "secrets": [
+        {
+          "name": "AOT_CONFIG_CONTENT",
+          "valueFrom": "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/adot-collector-config"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD", "/healthcheck"],
+        "interval": 10,
+        "timeout": 5,
+        "retries": 5,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/<APP_NAME>/<ENV>/adot-collector",
+          "awslogs-region": "<AWS_REGION>",
+          "awslogs-stream-prefix": "adot",
+          "awslogs-create-group": "true"
+        }
+      }
+    },
+    {
+      "name": "cwagent",
+      "image": "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest",
+      "essential": false,
+      "cpu": 128,
+      "memory": 256,
+      "portMappings": [
+        { "containerPort": 8125, "protocol": "udp", "name": "statsd" },
+        { "containerPort": 25888, "protocol": "tcp", "name": "emf" }
+      ],
+      "secrets": [
+        {
+          "name": "CW_CONFIG_CONTENT",
+          "valueFrom": "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/cwagent-config"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/<APP_NAME>/<ENV>/cwagent",
+          "awslogs-region": "<AWS_REGION>",
+          "awslogs-stream-prefix": "cwagent",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

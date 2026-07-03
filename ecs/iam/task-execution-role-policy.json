@@ -1,0 +1,61 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcrPull",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrPullRepo",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchCheckLayerAvailability"
+      ],
+      "Resource": [
+        "arn:aws:ecr:<AWS_REGION>:<ACCOUNT_ID>:repository/<APP_NAME>-front",
+        "arn:aws:ecr:<AWS_REGION>:<ACCOUNT_ID>:repository/<APP_NAME>-back"
+      ]
+    },
+    {
+      "Sid": "AwsLogsDriver",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:<AWS_REGION>:<ACCOUNT_ID>:log-group:/ecs/<APP_NAME>/<ENV>/*"
+    },
+    {
+      "Sid": "SsmParameterRead",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameters"
+      ],
+      "Resource": [
+        "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/adot-collector-config",
+        "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/cwagent-config",
+        "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/db/password"
+      ]
+    },
+    {
+      "Sid": "KmsDecryptForSecureString",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": "arn:aws:kms:<AWS_REGION>:<ACCOUNT_ID>:key/<KMS_KEY_ID>",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.<AWS_REGION>.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "POST",
+    "urlPathPattern": "/api/reports.*"
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": {
+      "reportId": "dummy-0001",
+      "status": "GENERATED",
+      "message": "SVF mock response (local only)"
+    },
+    "fixedDelayMilliseconds": 150
+  }
+}

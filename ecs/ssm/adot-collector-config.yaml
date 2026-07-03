@@ -1,0 +1,66 @@
+# =============================================================================
+# ADOT Collector 設定 (ECS / X-Ray 送信用)
+# SSM Parameter Store: /<APP_NAME>/<ENV>/adot-collector-config に String として登録し、
+# ECS タスク定義の secrets (AOT_CONFIG_CONTENT) で注入する。
+# =============================================================================
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        # awsvpc モードではタスク内 localhost 通信のため 127.0.0.1 でも動くが、
+        # ECS Exec でのデバッグ容易性のため 0.0.0.0 を推奨(SG でタスク外からは遮断)
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 必ずパイプラインの先頭に置く(OOM 防止)
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+
+  # ECS タスクメタデータから aws.ecs.cluster.arn / aws.ecs.task.family /
+  # aws.ecs.task.revision / cloud.* などの resource 属性を自動付与する
+  resourcedetection/ecs:
+    detectors: [env, ecs]
+    timeout: 2s
+    override: false
+
+  # deployment.environment を欠落時に補完する例(アプリ側 OTEL_RESOURCE_ATTRIBUTES が優先)
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: <ENV>
+        action: insert
+
+  # バッチ化(X-Ray API 呼び出し回数と CPU を削減)
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  awsxray:
+    region: <AWS_REGION>
+    # X-Ray コンソールのフィルタ式・グループで検索可能にする注釈(annotation)へ昇格させる属性
+    indexed_attributes:
+      - service.namespace
+      - deployment.environment
+      - aws.ecs.service.name
+      - aws.ecs.task.family
+    # true にすると全属性が annotation になりコスト増。通常は false + 明示列挙を推奨
+    index_all_attributes: false
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection/ecs, resource, batch]
+      exporters: [awsxray]
+  telemetry:
+    logs:
+      level: info   # トラブルシュート時のみ debug に変更

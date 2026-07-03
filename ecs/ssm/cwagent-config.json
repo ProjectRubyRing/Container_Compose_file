@@ -1,0 +1,21 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "debug": false
+  },
+  "metrics": {
+    "namespace": "<APP_NAME>/<ENV>",
+    "metrics_collected": {
+      "statsd": {
+        "service_address": ":8125",
+        "metrics_collection_interval": 60,
+        "metrics_aggregation_interval": 60
+      }
+    }
+  },
+  "logs": {
+    "metrics_collected": {
+      "emf": {}
+    }
+  }
+}

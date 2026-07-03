@@ -1,0 +1,57 @@
+# =============================================================================
+# ADOT Collector 設定 (ローカル compose 用)
+# ECS 用設定 (ecs/ssm/adot-collector-config.yaml) との差分は exporter のみ:
+#   awsxray → debug (コンソール出力) + otlphttp (Jaeger UI へ転送)
+# receiver / processor 構成は ECS と同一にして検証の等価性を保つ。
+# =============================================================================
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+  # ローカルでは ECS メタデータエンドポイントが無いため resourcedetection/ecs は
+  # env のみ (存在しなくてもエラーにはならないが挙動を明示)
+  resourcedetection/ecs:
+    detectors: [env]
+    timeout: 2s
+    override: false
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: local
+        action: insert
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  # 受信スパンをコレクタログへ出力 (docker compose logs adot-collector で確認)
+  debug:
+    verbosity: normal
+  # Jaeger は OTLP をネイティブ受信する (X-Ray コンソールの代替 UI)
+  otlphttp/jaeger:
+    endpoint: http://jaeger:4318
+    tls:
+      insecure: true
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection/ecs, resource, batch]
+      exporters: [debug, otlphttp/jaeger]
+  telemetry:
+    logs:
+      level: info

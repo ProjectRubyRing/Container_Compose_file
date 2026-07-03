@@ -1,0 +1,53 @@
+# =============================================================================
+# JBoss EAP 8.1 ビルド時設定スクリプト (jboss-cli.sh --file= で実行 / embed-server 方式)
+# - MySQL JDBC ドライバをモジュール登録
+# - XA データソース (JNDI: java:jboss/datasources/AppXADS) を作成 → 2PC 対応
+# - transactions サブシステムの node-identifier を起動時プロパティで差し替え可能にする
+#
+# 接続先ホスト等は ${env.XXX} 形式で「起動時の環境変数」を参照するため、
+# ビルド成果物イメージは環境非依存 (dev/stg/prod, compose/ECS で同一イメージ)。
+# =============================================================================
+embed-server --server-config=standalone.xml --std-out=echo
+
+# --- MySQL Connector/J をモジュールとして追加 -------------------------------
+# 注: EAP 8 (Jakarta EE 10) では jakarta.transaction.api への依存を指定する。
+module add --name=com.mysql --resources=/tmp/mysql-connector-j.jar --dependencies=jakarta.transaction.api
+
+# --- JDBC ドライバ登録 (XA データソースクラスを明示) -------------------------
+/subsystem=datasources/jdbc-driver=mysql:add( \
+    driver-name=mysql, \
+    driver-module-name=com.mysql, \
+    driver-xa-datasource-class-name=com.mysql.cj.jdbc.MysqlXADataSource \
+)
+
+# --- XA データソース (2PC 用) ------------------------------------------------
+/subsystem=datasources/xa-data-source=AppXADS:add( \
+    jndi-name=java:jboss/datasources/AppXADS, \
+    driver-name=mysql, \
+    user-name=${env.DB_USER}, \
+    password=${env.DB_PASSWORD}, \
+    min-pool-size=5, \
+    max-pool-size=20, \
+    pool-prefill=false, \
+    same-rm-override=false, \
+    interleaving=false, \
+    pad-xid=false, \
+    wrap-xa-resource=true, \
+    validate-on-match=true, \
+    background-validation=false, \
+    valid-connection-checker-class-name=org.jboss.jca.adapters.jdbc.extensions.mysql.MySQLValidConnectionChecker, \
+    exception-sorter-class-name=org.jboss.jca.adapters.jdbc.extensions.mysql.MySQLExceptionSorter \
+)
+/subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=ServerName:add(value=${env.DB_HOST})
+/subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=PortNumber:add(value=${env.DB_PORT})
+/subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=DatabaseName:add(value=${env.DB_NAME})
+# MySQL の XA 制約 (同一 XID の XA START〜XA PREPARE は同一物理コネクション必須) への対策
+/subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=PinGlobalTxToPhysicalConnection:add(value=true)
+# TLS 接続 (Aurora / RDS Proxy 接続時は要件に応じて VERIFY_IDENTITY 等へ変更)
+/subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=SslMode:add(value=${env.DB_SSL_MODE:PREFERRED})
+
+# --- トランザクションマネージャ: XA リカバリ用ノード ID ----------------------
+# 同一 DB を共有する全 EAP インスタンスで一意にすること (起動時に -Djboss.tx.node.id で注入)
+/subsystem=transactions:write-attribute(name=node-identifier, value=${jboss.tx.node.id:changeme})
+
+stop-embedded-server
