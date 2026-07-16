@@ -1,0 +1,28 @@
+{
+  "mappings": [
+    {
+      "name": "ECS Metadata v4: GET ${ECS_CONTAINER_METADATA_URI_V4}/task/stats (簡略化: 空 JSON)",
+      "request": {
+        "method": "GET",
+        "urlPathPattern": "/v4/[^/]+/task/stats"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {}
+      }
+    },
+    {
+      "name": "ECS Metadata v4: GET ${ECS_CONTAINER_METADATA_URI_V4}/stats (簡略化: 空 JSON)",
+      "request": {
+        "method": "GET",
+        "urlPathPattern": "/v4/[^/]+/stats"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {}
+      }
+    }
+  ]
+}
