@@ -11,12 +11,22 @@
 #   svf-mock (WireMock)       → ALB 越しの SVF 帳票サーバの代替
 #   ecs-metadata-mock         → ECS Task Metadata Endpoint v4
 #                               (ECS_CONTAINER_METADATA_URI_V4) のダミー応答
-#   cwagent                   → ローカル代替なし (メトリクス送信先の CloudWatch が
-#                               ローカルに存在しないため除外。トレース検証には不要)
+#   efs-mock                  → EFS の代替 (アクセスポイント不使用・マウントポイントのみ
+#                               利用する想定)。named volume を UID 6301 / GID 6302 で
+#                               初期化し、front/back へ /mnt/logs, /mnt/data として共有
+#   cwagent                   → ECS と同じ CloudWatch Agent イメージのサイドカー。
+#                               偽装 EFS 上のログファイルを検知して tail し、
+#                               logs.endpoint_override で cloudwatch-logs-mock へ送信
+#                               (実 CloudWatch Logs には送信しない)
+#   cloudwatch-logs-mock      → CloudWatch Logs API のスタブ (WireMock)。cwagent からの
+#                               PutLogEvents を受信し、request journal で送信内容を確認
 #
 # ECS では同一タスク内 localhost 通信だが、compose では各サービスが別ネットワーク
 # 名前空間のため、宛先を環境変数 (OTEL_EXPORTER_OTLP_ENDPOINT / BACK_BASE_URL 等)
 # で切り替えて等価性を担保する。
+#
+# 注意: この compose はテスト環境専用のため、DB パスワード等の秘匿情報は .env に
+# 逃がさず本ファイルへ直書きしている (本番の値を書かないこと)。
 # =============================================================================
 name: eap-adot-local
 
@@ -40,13 +50,21 @@ services:
       DB_PORT: "3306"
       DB_NAME: appdb
       DB_USER: appuser
-      DB_PASSWORD: ${APPDB_PASSWORD:?set in .env}
+      DB_PASSWORD: "ChangeMe_appdb_P@ss123"   # テスト環境用ダミー値 (直書き)
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       BACK_BASE_URL: http://app-back:8180
       TX_NODE_ID: front-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890
+    # 偽装 EFS (named volume)。実 ECS では EFS ボリューム (アクセスポイント不使用) を
+    # 同じパスにマウントする。コンテナは jboss (UID 185) で動くため、GID 6302 を
+    # 補助グループに追加してマウントポイント (6301:6302, mode 2775) へ書き込む
+    volumes:
+      - efs-logs:/mnt/logs
+      - efs-data:/mnt/data
+    group_add:
+      - "6302"
     depends_on:
       adot-collector:
         condition: service_healthy
@@ -58,6 +76,8 @@ services:
         condition: service_started
       ecs-metadata-mock:
         condition: service_started
+      efs-mock:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8080/ >/dev/null || exit 1"]
       interval: 30s
@@ -85,13 +105,19 @@ services:
       DB_PORT: "3306"
       DB_NAME: appdb
       DB_USER: appuser
-      DB_PASSWORD: ${APPDB_PASSWORD:?set in .env}
+      DB_PASSWORD: "ChangeMe_appdb_P@ss123"   # テスト環境用ダミー値 (直書き)
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       SVF_BASE_URL: http://svf-mock:8080
       TX_NODE_ID: back-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-2345678901
+    # 偽装 EFS (named volume)。front と同じ 2 マウントポイントを共有する
+    volumes:
+      - efs-logs:/mnt/logs
+      - efs-data:/mnt/data
+    group_add:
+      - "6302"
     depends_on:
       adot-collector:
         condition: service_healthy
@@ -103,6 +129,8 @@ services:
         condition: service_started
       ecs-metadata-mock:
         condition: service_started
+      efs-mock:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8180/ >/dev/null || exit 1"]
       interval: 30s
@@ -147,13 +175,14 @@ services:
     image: mysql:8.0.42
     container_name: mysql
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set in .env}
+      # テスト環境専用のためパスワードは直書き (本番の値を書かないこと)
+      MYSQL_ROOT_PASSWORD: "localdev-root-change-me"
       # appdb / appuser は公式イメージのエントリポイントが作成
       MYSQL_DATABASE: appdb
       MYSQL_USER: appuser
-      MYSQL_PASSWORD: ${APPDB_PASSWORD:?set in .env}
+      MYSQL_PASSWORD: "ChangeMe_appdb_P@ss123"
       # infdb / infuser は 20-init-infdb.sh が作成 (パスワードはこの変数で注入)
-      INFDB_PASSWORD: ${INFDB_PASSWORD:?set in .env}
+      INFDB_PASSWORD: "ChangeMe_infdb_P@ss123"
     volumes:
       - ./compose/mysql/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
       - ./compose/mysql/init-infdb.sh:/docker-entrypoint-initdb.d/20-init-infdb.sh:ro
@@ -195,5 +224,77 @@ services:
     ports:
       - "8380:8080"  # 例: curl http://localhost:8380/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890/task
 
+  # ---------------------------------------------------------------------------
+  # EFS のローカル代替 (アクセスポイントは使わず、マウントポイントのみ利用する想定)
+  # - アクセスポイント不使用の EFS では POSIX 権限がそのまま適用されるため、
+  #   実環境でファイルシステム作成後に一度だけ root で行う初期 chown/chmod に相当する
+  #   処理を、このコンテナが named volume に対して冪等に実行する
+  # - /mnt/logs, /mnt/data の 2 マウントポイントを UID 6301 / GID 6302, mode 2775
+  #   (setgid: 配下に作られるファイルへ GID 6302 を継承) で初期化する
+  # - named volume を使うためホスト側ディレクトリの権限設定は一切変更不要
+  #   (compose 環境内だけで完結する)
+  efs-mock:
+    image: alpine:3.21
+    container_name: efs-mock
+    command:
+      - sh
+      - -euc
+      - |
+        chown 6301:6302 /mnt/efs/logs /mnt/efs/data
+        chmod 2775 /mnt/efs/logs /mnt/efs/data
+        echo "[efs-mock] initialized /mnt/efs/logs /mnt/efs/data (owner=6301:6302 mode=2775)"
+        touch /tmp/efs-initialized
+        exec tail -f /dev/null
+    volumes:
+      - efs-logs:/mnt/efs/logs
+      - efs-data:/mnt/efs/data
+    healthcheck:
+      # 初期化完了と所有者 6301:6302 を確認できたら healthy (front/back はこれを待つ)
+      test: ["CMD-SHELL", "test -f /tmp/efs-initialized && [ \"$$(stat -c %u:%g /mnt/efs/logs)\" = \"6301:6302\" ] && [ \"$$(stat -c %u:%g /mnt/efs/data)\" = \"6301:6302\" ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # ECS taskdef と同じ CloudWatch Agent イメージのサイドカー (ローカル用途はログ転送の偽装)
+  # 偽装 EFS (/mnt/logs) に出力されたファイルを検知して tail し、
+  # logs.endpoint_override により実 CloudWatch Logs の代わりに cloudwatch-logs-mock へ
+  # PutLogEvents を送信する。認証情報は SigV4 署名を通すためだけのダミー値
+  # (logs 出力は環境変数ではなく共有クレデンシャルファイルを参照するためファイルで注入)
+  cwagent:
+    image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
+    container_name: cwagent
+    environment:
+      AWS_REGION: ap-northeast-1
+    volumes:
+      # ECS では SSM Parameter Store (CW_CONFIG_CONTENT) で注入する設定を、
+      # ローカルでは /etc/cwagentconfig へのファイルマウントで注入する
+      - ./compose/cwagent/cwagent-config.json:/etc/cwagentconfig/cwagent-config.json:ro
+      - ./compose/cwagent/aws-credentials:/root/.aws/credentials:ro
+      - efs-logs:/mnt/logs:ro   # 読み取り専用で十分 (tail するだけ)
+    depends_on:
+      efs-mock:
+        condition: service_healthy
+      cloudwatch-logs-mock:
+        condition: service_started
+
+  # CloudWatch Logs API のローカル代替スタブ (cwagent の「送信の偽装」先)
+  # CreateLogGroup / CreateLogStream / PutLogEvents を 200 で受けるだけで実送信はしない。
+  # 受信内容は WireMock の request journal で確認する:
+  #   curl -s -X POST http://localhost:8480/__admin/requests/count \
+  #        -H "Content-Type: application/json" \
+  #        -d '{"method":"POST","headers":{"X-Amz-Target":{"equalTo":"Logs_20140328.PutLogEvents"}}}'
+  cloudwatch-logs-mock:
+    image: wiremock/wiremock:3.13.0
+    container_name: cloudwatch-logs-mock
+    volumes:
+      - ./compose/cloudwatch-logs-mock/mappings:/home/wiremock/mappings:ro
+    ports:
+      - "8480:8080"
+
 volumes:
   mysql-data:
+  # 偽装 EFS の実体。ホストのディレクトリを bind mount しないことで、
+  # ホスト側のユーザ/権限設定に依存せず UID 6301 / GID 6302 を維持できる
+  efs-logs:
+  efs-data:

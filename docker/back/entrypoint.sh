@@ -65,6 +65,28 @@ log "jboss.socket.binding.port-offset=${PORT_OFFSET} (HTTP listens on $((8080 + 
 TX_NODE_ID="${TX_NODE_ID:-back-$(hostname)}"
 log "transaction node-identifier=${TX_NODE_ID}"
 
+# --- EFS マウントポイント (/mnt/logs, /mnt/data) への書き込み検証 --------------
+# ECS では EFS (アクセスポイント不使用)、ローカル compose では efs-mock が初期化した
+# named volume がマウントされる想定。マウントされていない環境では検証をスキップする。
+# /mnt/logs への書き込みは cwagent のファイル検知トリガーも兼ねる。
+EFS_LOG_DIR="${EFS_LOG_DIR:-/mnt/logs}"
+EFS_DATA_DIR="${EFS_DATA_DIR:-/mnt/data}"
+EFS_MARKER="$(date -u '+%Y-%m-%dT%H:%M:%SZ') [app-back] startup uid=$(id -u) gid=$(id -g) groups=$(id -G) host=$(hostname)"
+if [[ -d "${EFS_LOG_DIR}" ]]; then
+  if echo "${EFS_MARKER}" >> "${EFS_LOG_DIR}/app-back.log" 2>/dev/null; then
+    log "EFS write check OK: ${EFS_LOG_DIR}/app-back.log"
+  else
+    log "WARN: cannot write to ${EFS_LOG_DIR} (uid=$(id -u) groups=$(id -G))"
+  fi
+fi
+if [[ -d "${EFS_DATA_DIR}" ]]; then
+  if echo "${EFS_MARKER}" >> "${EFS_DATA_DIR}/app-back-data.txt" 2>/dev/null; then
+    log "EFS write check OK: ${EFS_DATA_DIR}/app-back-data.txt"
+  else
+    log "WARN: cannot write to ${EFS_DATA_DIR} (uid=$(id -u) groups=$(id -G))"
+  fi
+fi
+
 exec "${JBOSS_HOME}/bin/standalone.sh" \
   -b 0.0.0.0 \
   -bmanagement 127.0.0.1 \

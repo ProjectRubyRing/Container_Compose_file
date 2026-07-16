@@ -15,6 +15,8 @@ compose/
   mysql/init-infdb.sh                # infdb / infuser の作成 (2 スキーマ目)
   svf-mock/mappings/report.json      # SVF 帳票サーバの WireMock スタブ
   ecs-metadata-mock/mappings/        # ECS Task Metadata Endpoint v4 の WireMock スタブ
+  cwagent/cwagent-config.json        # CloudWatch Agent ローカル設定 (endpoint_override → mock)
+  cloudwatch-logs-mock/mappings/     # CloudWatch Logs API の WireMock スタブ (送信の偽装先)
 docker/
   cli/mysql-xa-datasource.cli        # ビルド時 JBoss CLI (XA データソース / 2PC 設定)
   front/Dockerfile, entrypoint.sh    # フロントコンテナ (HTTP 8080)
@@ -32,10 +34,28 @@ ecs/
 ## ローカル検証 (AWS 非接続)
 
 ```bash
-cp .env.example .env          # EAP_BASE_IMAGE とダミーパスワードを設定
+cp .env.example .env          # EAP_BASE_IMAGE を設定 (DB パスワードはテスト用に compose.yaml へ直書き済み)
 docker compose up -d --build
 ./verify-local.sh
 # Jaeger UI: http://localhost:16686
+```
+
+## EFS / CloudWatch Logs 転送の偽装
+
+- `efs-mock` が named volume (`efs-logs` / `efs-data`) を **UID 6301 / GID 6302, mode 2775 (setgid)** で
+  初期化し、front/back へ `/mnt/logs` `/mnt/data` としてマウントする
+  (EFS をアクセスポイント不使用・マウントポイントのみで利用する運用を模擬)。
+- front/back は `group_add: 6302` で書き込み権限を得る。named volume のため
+  **ホスト側のディレクトリ権限の変更は不要** (compose 環境内で完結)。
+- `cwagent` (ECS taskdef と同じ CloudWatch Agent イメージ) が `/mnt/logs` の
+  `app-front*.log` / `app-back*.log` を検知・tail し、`logs.endpoint_override` により
+  実 AWS ではなく `cloudwatch-logs-mock` (WireMock, http://localhost:8480) へ PutLogEvents を送信する。
+- 送信の確認 (件数):
+
+```bash
+curl -s -X POST http://localhost:8480/__admin/requests/count \
+  -H "Content-Type: application/json" \
+  -d '{"method":"POST","url":"/","headers":{"X-Amz-Target":{"equalTo":"Logs_20140328.PutLogEvents"}}}'
 ```
 
 ## 置き換えプレースホルダー

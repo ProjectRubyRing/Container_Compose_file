@@ -1,0 +1,15 @@
+{
+  "priority": 1,
+  "request": {
+    "method": "POST",
+    "url": "/",
+    "headers": {
+      "X-Amz-Target": { "equalTo": "Logs_20140328.DescribeLogStreams" }
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/x-amz-json-1.1" },
+    "jsonBody": { "logStreams": [] }
+  }
+}
