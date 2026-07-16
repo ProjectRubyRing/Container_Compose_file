@@ -19,10 +19,11 @@ processors:
     check_interval: 1s
     limit_percentage: 75
     spike_limit_percentage: 20
-  # ローカルでは ECS メタデータエンドポイントが無いため resourcedetection/ecs は
-  # env のみ (存在しなくてもエラーにはならないが挙動を明示)
+  # ローカルでは ecs-metadata-mock が ECS Task Metadata Endpoint v4 を偽装するため
+  # ECS と同じ ecs 検出器を有効化できる (ECS_CONTAINER_METADATA_URI_V4 は
+  # compose.yaml でモックの URL を注入している)
   resourcedetection/ecs:
-    detectors: [env]
+    detectors: [env, ecs]
     timeout: 2s
     override: false
   resource:

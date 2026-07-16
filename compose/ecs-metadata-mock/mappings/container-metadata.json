@@ -1,0 +1,160 @@
+{
+  "mappings": [
+    {
+      "name": "ECS Container Metadata v4: app-front (GET ${ECS_CONTAINER_METADATA_URI_V4})",
+      "request": {
+        "method": "GET",
+        "urlPath": "/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {
+          "DockerId": "158d1c8083dd49d6b527399fd6414f5c-1234567890",
+          "Name": "app-front",
+          "DockerName": "app-front",
+          "Image": "111122223333.dkr.ecr.ap-northeast-1.amazonaws.com/myapp-front:local",
+          "ImageID": "sha256:0f5b2a8c1d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a",
+          "Labels": {
+            "com.amazonaws.ecs.cluster": "arn:aws:ecs:ap-northeast-1:111122223333:cluster/myapp-local-cluster",
+            "com.amazonaws.ecs.container-name": "app-front",
+            "com.amazonaws.ecs.task-arn": "arn:aws:ecs:ap-northeast-1:111122223333:task/myapp-local-cluster/158d1c8083dd49d6b527399fd6414f5c",
+            "com.amazonaws.ecs.task-definition-family": "myapp-local-task",
+            "com.amazonaws.ecs.task-definition-version": "1"
+          },
+          "DesiredStatus": "RUNNING",
+          "KnownStatus": "RUNNING",
+          "Limits": { "CPU": 768, "Memory": 1536 },
+          "CreatedAt": "2026-07-16T00:00:40.111111111Z",
+          "StartedAt": "2026-07-16T00:00:41.111111111Z",
+          "Type": "NORMAL",
+          "ContainerARN": "arn:aws:ecs:ap-northeast-1:111122223333:container/myapp-local-cluster/158d1c8083dd49d6b527399fd6414f5c/0a1b2c3d-4e5f-6789-0abc-def012345601",
+          "LogDriver": "awslogs",
+          "LogOptions": {
+            "awslogs-group": "/ecs/myapp/local/app-front",
+            "awslogs-region": "ap-northeast-1",
+            "awslogs-stream-prefix": "front"
+          },
+          "Networks": [
+            {
+              "NetworkMode": "awsvpc",
+              "IPv4Addresses": ["10.0.2.61"],
+              "AttachmentIndex": 0,
+              "MACAddress": "0e:10:e2:01:bd:91",
+              "IPv4SubnetCIDRBlock": "10.0.2.0/24",
+              "DomainNameServers": ["10.0.0.2"],
+              "DomainNameSearchList": ["ap-northeast-1.compute.internal"],
+              "PrivateDNSName": "ip-10-0-2-61.ap-northeast-1.compute.internal",
+              "SubnetGatewayIpv4Address": "10.0.2.1/24"
+            }
+          ],
+          "Snapshotter": "overlayfs"
+        }
+      }
+    },
+    {
+      "name": "ECS Container Metadata v4: app-back (GET ${ECS_CONTAINER_METADATA_URI_V4})",
+      "request": {
+        "method": "GET",
+        "urlPath": "/v4/158d1c8083dd49d6b527399fd6414f5c-2345678901"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {
+          "DockerId": "158d1c8083dd49d6b527399fd6414f5c-2345678901",
+          "Name": "app-back",
+          "DockerName": "app-back",
+          "Image": "111122223333.dkr.ecr.ap-northeast-1.amazonaws.com/myapp-back:local",
+          "ImageID": "sha256:1a6c3b9d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+          "Labels": {
+            "com.amazonaws.ecs.cluster": "arn:aws:ecs:ap-northeast-1:111122223333:cluster/myapp-local-cluster",
+            "com.amazonaws.ecs.container-name": "app-back",
+            "com.amazonaws.ecs.task-arn": "arn:aws:ecs:ap-northeast-1:111122223333:task/myapp-local-cluster/158d1c8083dd49d6b527399fd6414f5c",
+            "com.amazonaws.ecs.task-definition-family": "myapp-local-task",
+            "com.amazonaws.ecs.task-definition-version": "1"
+          },
+          "DesiredStatus": "RUNNING",
+          "KnownStatus": "RUNNING",
+          "Limits": { "CPU": 768, "Memory": 1536 },
+          "CreatedAt": "2026-07-16T00:00:40.222222222Z",
+          "StartedAt": "2026-07-16T00:00:41.222222222Z",
+          "Type": "NORMAL",
+          "ContainerARN": "arn:aws:ecs:ap-northeast-1:111122223333:container/myapp-local-cluster/158d1c8083dd49d6b527399fd6414f5c/0a1b2c3d-4e5f-6789-0abc-def012345602",
+          "LogDriver": "awslogs",
+          "LogOptions": {
+            "awslogs-group": "/ecs/myapp/local/app-back",
+            "awslogs-region": "ap-northeast-1",
+            "awslogs-stream-prefix": "back"
+          },
+          "Networks": [
+            {
+              "NetworkMode": "awsvpc",
+              "IPv4Addresses": ["10.0.2.61"],
+              "AttachmentIndex": 0,
+              "MACAddress": "0e:10:e2:01:bd:91",
+              "IPv4SubnetCIDRBlock": "10.0.2.0/24",
+              "DomainNameServers": ["10.0.0.2"],
+              "DomainNameSearchList": ["ap-northeast-1.compute.internal"],
+              "PrivateDNSName": "ip-10-0-2-61.ap-northeast-1.compute.internal",
+              "SubnetGatewayIpv4Address": "10.0.2.1/24"
+            }
+          ],
+          "Snapshotter": "overlayfs"
+        }
+      }
+    },
+    {
+      "name": "ECS Container Metadata v4: adot-collector (GET ${ECS_CONTAINER_METADATA_URI_V4})",
+      "request": {
+        "method": "GET",
+        "urlPath": "/v4/158d1c8083dd49d6b527399fd6414f5c-3456789012"
+      },
+      "response": {
+        "status": 200,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": {
+          "DockerId": "158d1c8083dd49d6b527399fd6414f5c-3456789012",
+          "Name": "adot-collector",
+          "DockerName": "adot-collector",
+          "Image": "public.ecr.aws/aws-observability/aws-otel-collector:v0.43.3",
+          "ImageID": "sha256:2b7d4c0e3f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
+          "Labels": {
+            "com.amazonaws.ecs.cluster": "arn:aws:ecs:ap-northeast-1:111122223333:cluster/myapp-local-cluster",
+            "com.amazonaws.ecs.container-name": "adot-collector",
+            "com.amazonaws.ecs.task-arn": "arn:aws:ecs:ap-northeast-1:111122223333:task/myapp-local-cluster/158d1c8083dd49d6b527399fd6414f5c",
+            "com.amazonaws.ecs.task-definition-family": "myapp-local-task",
+            "com.amazonaws.ecs.task-definition-version": "1"
+          },
+          "DesiredStatus": "RUNNING",
+          "KnownStatus": "RUNNING",
+          "Limits": { "CPU": 256, "Memory": 512 },
+          "CreatedAt": "2026-07-16T00:00:40.333333333Z",
+          "StartedAt": "2026-07-16T00:00:41.333333333Z",
+          "Type": "NORMAL",
+          "ContainerARN": "arn:aws:ecs:ap-northeast-1:111122223333:container/myapp-local-cluster/158d1c8083dd49d6b527399fd6414f5c/0a1b2c3d-4e5f-6789-0abc-def012345603",
+          "LogDriver": "awslogs",
+          "LogOptions": {
+            "awslogs-group": "/ecs/myapp/local/adot-collector",
+            "awslogs-region": "ap-northeast-1",
+            "awslogs-stream-prefix": "adot"
+          },
+          "Networks": [
+            {
+              "NetworkMode": "awsvpc",
+              "IPv4Addresses": ["10.0.2.61"],
+              "AttachmentIndex": 0,
+              "MACAddress": "0e:10:e2:01:bd:91",
+              "IPv4SubnetCIDRBlock": "10.0.2.0/24",
+              "DomainNameServers": ["10.0.0.2"],
+              "DomainNameSearchList": ["ap-northeast-1.compute.internal"],
+              "PrivateDNSName": "ip-10-0-2-61.ap-northeast-1.compute.internal",
+              "SubnetGatewayIpv4Address": "10.0.2.1/24"
+            }
+          ],
+          "Snapshotter": "overlayfs"
+        }
+      }
+    }
+  ]
+}

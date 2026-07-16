@@ -35,5 +35,18 @@ docker compose exec app-front /opt/server/bin/jboss-cli.sh --connect \
   "/subsystem=datasources/xa-data-source=AppXADS:test-connection-in-pool" || \
   echo "WARN: XA 接続テスト失敗。DB_HOST/DB_USER/DB_PASSWORD と MySQL の起動状態を確認。"
 
+echo "=== 8. MySQL 2 スキーマ (appdb/appuser, infdb/infuser) の初期化確認 ==="
+# パスワードは mysql コンテナ内の環境変数 (.env 由来) を使う
+docker compose exec mysql sh -c 'mysql -uappuser -p"$MYSQL_PASSWORD" -e "SELECT 1" appdb >/dev/null' \
+  && echo "appdb/appuser: OK" || echo "WARN: appdb/appuser で接続できません"
+docker compose exec mysql sh -c 'mysql -uinfuser -p"$INFDB_PASSWORD" -e "SELECT 1" infdb >/dev/null' \
+  && echo "infdb/infuser: OK" || \
+  echo "WARN: infdb/infuser で接続できません。初期化は初回起動時のみ実行されるため、既存ボリュームがある場合は docker compose down -v で再作成してください。"
+
+echo "=== 9. ECS メタデータモック (/task) の確認 ==="
+curl -s "http://localhost:8380/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890/task" \
+  | grep -q '"TaskARN"' && echo "ecs-metadata-mock /task: OK" || \
+  echo "WARN: ecs-metadata-mock から TaskARN を含む応答が得られません"
+
 echo ""
 echo "Jaeger UI でトレースを確認: http://localhost:16686  (Service: myapp-front / myapp-back)"
