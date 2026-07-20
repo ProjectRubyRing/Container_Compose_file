@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  =============================================================================
+  async-receiver — app-back に配備する Java サーブレット WAR
+  ---------------------------------------------------------------------------
+  Lambda が ALB 経由で POST してくる先。JBoss EAP 8.1 (Jakarta EE 10) 上で動く。
+  この WAR は back/Dockerfile のビルドステージ (maven) 内でビルドされ、
+  ${JBOSS_HOME}/standalone/deployments/ に async-receiver.war として配備される。
+  jakarta.servlet-api は EAP が提供するため scope=provided (WAR には含めない)。
+  =============================================================================
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example.async</groupId>
+    <artifactId>async-receiver</artifactId>
+    <version>1.0.0</version>
+    <packaging>war</packaging>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <failOnMissingWebXml>false</failOnMissingWebXml>
+    </properties>
+
+    <dependencies>
+        <!-- Jakarta EE 10 Servlet API。EAP が提供するので WAR には同梱しない -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <version>6.0.0</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- 生成される WAR 名 = async-receiver.war (コンテキストは jboss-web.xml で /async) -->
+        <finalName>async-receiver</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-war-plugin</artifactId>
+                <version>3.4.0</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>

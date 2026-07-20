@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  コンテキストルートを /async に固定する。
+  WAR 名 (async-receiver.war) に依存せず、URL を /async/receive に確定させるため。
+  ALB のリスナールール /async/* とアプリ側パスをこの1ファイルで一致させている。
+-->
+<jboss-web xmlns="http://www.jboss.com/xml/ns/javaee"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xsi:schemaLocation="http://www.jboss.com/xml/ns/javaee http://www.jboss.org/j2ee/schema/jboss-web_10_0.xsd">
+    <context-root>/async</context-root>
+</jboss-web>

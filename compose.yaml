@@ -54,6 +54,11 @@ services:
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       BACK_BASE_URL: http://app-back:8180
+      # 非同期処理用 SQS (ElasticMQ) のローカルエンドポイント。
+      # 実 AWS では SDK が IAM ロールとリージョンから解決するが、ローカルでは明示する。
+      ASYNC_SQS_ENDPOINT: http://sqs:9324
+      ASYNC_QUEUE_NAME: app-async-queue
+      AWS_REGION: ap-northeast-1
       TX_NODE_ID: front-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890
@@ -109,6 +114,10 @@ services:
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       SVF_BASE_URL: http://svf-mock:8080
+      # 非同期処理用 SQS (ElasticMQ) のローカルエンドポイント (front と同じキュー)
+      ASYNC_SQS_ENDPOINT: http://sqs:9324
+      ASYNC_QUEUE_NAME: app-async-queue
+      AWS_REGION: ap-northeast-1
       TX_NODE_ID: back-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-2345678901
@@ -291,6 +300,137 @@ services:
       - ./compose/cloudwatch-logs-mock/mappings:/home/wiremock/mappings:ro
     ports:
       - "8480:8080"
+
+  # ===========================================================================
+  # 非同期処理チェーン (SQS → Lambda → ALB → app-back)
+  # ---------------------------------------------------------------------------
+  #   app-front / app-back        → SQS(app-async-queue) にメッセージを積む (プロデューサ)
+  #   sqs (ElasticMQ)             → Amazon SQS のローカル代替 (キュー本体)
+  #   lambda-esm (poller.py)      → SQS イベントソースマッピングの代替。キューを
+  #                                 ロングポーリングし Lambda を HTTP invoke する
+  #   lambda (RIE + handler.py)   → AWS Lambda ランタイムのローカル代替。SQS イベントを
+  #                                 受け、ALB 経由で app-back を POST 呼び出しする
+  #   alb (nginx)                 → Application Load Balancer のローカル代替 (L7 ルーティング)
+  #                                 /async/* を app-back:8180 のサーブレットへ転送する
+  #   app-back の /async/receive  → Java サーブレット (async-receiver.war) が POST を受信
+  #
+  # 詳細な仕組み・設定方法は docs/ASYNC-SQS-LAMBDA-ALB.md を参照。
+  # ===========================================================================
+
+  # --- Amazon SQS のローカル代替 (ElasticMQ) ---------------------------------
+  # 起動時に compose/sqs/elasticmq.conf の queues 定義から
+  # app-async-queue と app-async-dlq を自動作成する。
+  sqs:
+    image: softwaremill/elasticmq-native:1.6.11
+    container_name: sqs
+    volumes:
+      - ./compose/sqs/elasticmq.conf:/opt/elasticmq.conf:ro
+    ports:
+      - "9324:9324"   # SQS 互換 REST API (aws --endpoint-url http://localhost:9324 ...)
+      - "9325:9325"   # 統計/管理 UI (http://localhost:9325)
+
+  # --- AWS Lambda ランタイムのローカル代替 (公式ベースイメージ + RIE) --------
+  # 公式 python イメージにはランタイムインターフェースエミュレータ (RIE) が同梱され、
+  # ローカルで起動すると 8080 で invoke エンドポイントを待ち受ける:
+  #   POST /2015-03-31/functions/function/invocations
+  # ハンドラコードは /var/task にマウントし、command でハンドラ名を渡す。
+  lambda:
+    image: public.ecr.aws/lambda/python:3.12
+    container_name: lambda
+    command: ["handler.lambda_handler"]   # <ファイル名>.<関数名>
+    environment:
+      ALB_ENDPOINT: http://alb:80         # POST 先 = ALB(nginx)
+      BACK_PATH: /async/receive           # ALB のリスナールール /async/* と一致
+      HTTP_TIMEOUT_SECONDS: "10"
+    volumes:
+      - ./compose/lambda/app:/var/task:ro # ここに handler.py を配置
+    ports:
+      - "9000:8080"                       # ホストから直接 invoke 検証する場合に使用
+    depends_on:
+      alb:
+        condition: service_started
+
+  # --- SQS イベントソースマッピングのローカル代替 (poller) --------------------
+  # 実 AWS の「SQS → Lambda 自動起動」を肩代わりする常駐プロセス。
+  lambda-esm:
+    build:
+      context: ./compose/lambda-esm
+      dockerfile: Dockerfile
+    container_name: lambda-esm
+    environment:
+      SQS_ENDPOINT: http://sqs:9324
+      QUEUE_NAME: app-async-queue
+      LAMBDA_INVOKE_URL: http://lambda:8080/2015-03-31/functions/function/invocations
+      AWS_REGION: ap-northeast-1
+      # ElasticMQ は署名検証しないがダミー資格情報が必要 (boto3 が必ず署名するため)
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      BATCH_SIZE: "10"
+      WAIT_TIME_SECONDS: "20"
+    depends_on:
+      sqs:
+        condition: service_started
+      lambda:
+        condition: service_started
+
+  # --- Application Load Balancer のローカル代替 (nginx) -----------------------
+  # /async/*      → app-back:8180 のサーブレット (ターゲットグループ)
+  # /maintenance* → メンテナンス Lambda (alb-lambda-adapter 経由の Lambda ターゲット)
+  # リスナールールは compose/alb/rules/*.conf に分離 (★差し替え可能★)。
+  # 全面メンテナンス ON/OFF は ./alb-maintenance.sh on|off で切り替える。
+  alb:
+    image: nginx:1.27-alpine
+    container_name: alb
+    volumes:
+      - ./compose/alb/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./compose/alb/rules:/etc/nginx/rules:ro   # リスナールール群 (差し替え可能)
+    ports:
+      - "9080:80"   # ホストから ALB 経由の疎通確認用 (http://localhost:9080/async/receive)
+    depends_on:
+      app-back:
+        condition: service_started
+      alb-lambda-adapter:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # --- メンテナンス画面用 Lambda のローカル代替 (RIE + maintenance.py) --------
+  # ALB のリスナールールから呼ばれ、メンテナンス画面 (HTML) とステータスコード
+  # (既定 503) を返す。maintenance.py はボリュームマウントのため差し替え可能。
+  maintenance-lambda:
+    image: public.ecr.aws/lambda/python:3.12
+    container_name: maintenance-lambda
+    command: ["maintenance.lambda_handler"]   # <ファイル名>.<関数名>
+    environment:
+      MAINTENANCE_STATUS_CODE: "503"           # メンテナンス用ステータスコード
+      RETRY_AFTER_SECONDS: "300"
+      MAINTENANCE_UNTIL: ""                     # 例: "2026-07-21 03:00 JST" (任意)
+    volumes:
+      - ./compose/maintenance-lambda/app:/var/task:ro   # ここに maintenance.py を配置
+    ports:
+      - "9001:8080"   # ホストから直接 invoke 検証する場合に使用
+
+  # --- ALB の Lambda ターゲット統合 (HTTP↔Lambda イベント変換) のローカル代替 --
+  # nginx(ALB) と maintenance-lambda(RIE) の間に入り、HTTP を ELB イベントへ変換して
+  # invoke し、Lambda 応答 (statusCode/headers/body) を HTTP レスポンスへ戻す。
+  alb-lambda-adapter:
+    image: python:3.12-slim
+    container_name: alb-lambda-adapter
+    command: ["python", "/app/adapter.py"]
+    environment:
+      LAMBDA_INVOKE_URL: http://maintenance-lambda:8080/2015-03-31/functions/function/invocations
+      LISTEN_PORT: "8080"
+    volumes:
+      - ./compose/alb-lambda-adapter/adapter.py:/app/adapter.py:ro
+    ports:
+      - "9081:8080"   # nginx を介さずアダプタ経由でメンテナンス画面を確認する場合に使用
+    depends_on:
+      maintenance-lambda:
+        condition: service_started
 
 volumes:
   mysql-data:
