@@ -6,7 +6,8 @@
 #   adot-collector            → 同じ ADOT Collector イメージ。exporter だけ
 #                               awsxray → debug + otlphttp(Jaeger) に差し替え
 #   jaeger                    → X-Ray コンソールの代替 (トレース可視化 UI)
-#   mysql (8.0.42)            → Aurora MySQL Serverless v2 + RDS Proxy の代替
+#   mysql (8.4.7)             → Aurora MySQL 8.4 (Serverless v2) + RDS Proxy の代替
+#                               (Aurora MySQL 8.4 互換のコミュニティ版 8.4.7 を使用)
 #   valkey                    → ElastiCache for Valkey の代替
 #   svf-mock (WireMock)       → ALB 越しの SVF 帳票サーバの代替
 #   ecs-metadata-mock         → ECS Task Metadata Endpoint v4
@@ -178,10 +179,12 @@ services:
     ports:
       - "16686:16686"  # UI: http://localhost:16686
 
-  # Aurora MySQL Serverless v2 のローカル代替
-  # appdb/appuser (アプリ用) と infdb/infuser (基盤用) の 2 スキーマを初期化する
+  # Aurora MySQL 8.4 (Serverless v2) のローカル代替
+  # Aurora MySQL 3.10.x は MySQL 8.4 互換のため、コミュニティ版 8.4.7 を使用する。
+  # 初期セットアップ (appdb/appuser・infdb/infuser の 2 スキーマ、XA_RECOVER_ADMIN 付与など)
+  # は 8.0.42 のときと同一。8.4 系での取り扱い差分は docs/MYSQL-8.4-AURORA-UPGRADE.md を参照。
   mysql:
-    image: mysql:8.0.42
+    image: mysql:8.4.7
     container_name: mysql
     environment:
       # テスト環境専用のためパスワードは直書き (本番の値を書かないこと)

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  =============================================================================
+  JBoss EAP 8.1 (JBoss Modules) 用 MySQL Connector/J 静的モジュール定義
+  -----------------------------------------------------------------------------
+  従来はビルド時に `module add` (embed-server) で module.xml を自動生成していたが、
+  Aurora MySQL 8.4 / MySQL 8.4.7 対応で Connector/J を 9.7.0 へ更新するのを機に、
+  module.xml を明示的なファイルとして管理する方式へ変更した。
+  こうすることで、依存関係・リソース jar・エクスポート範囲がコードレビュー可能になり、
+  ドライバ更新時の差分も module.xml 単体で追跡できる。
+
+  配置先 (最終イメージ):
+    ${JBOSS_HOME}/modules/com/mysql/main/module.xml
+    ${JBOSS_HOME}/modules/com/mysql/main/mysql-connector-j-9.7.0.jar
+
+  重要:
+    - <resource-root path="..."> の jar 名は Dockerfile の
+      MYSQL_CONNECTOR_VERSION と必ず一致させること (両者を同時に更新する)。
+    - EAP 8 (Jakarta EE 10) では XA データソースが 2PC で
+      jakarta.transaction.api を参照するため、依存に明示する
+      (EAP 7 系の javax.transaction.api 相当)。
+  =============================================================================
+-->
+<module xmlns="urn:jboss:module:1.9" name="com.mysql">
+
+    <resources>
+        <!-- Connector/J 9.7.0 (Aurora MySQL 8.4 / MySQL 8.4.7 互換ドライバ) -->
+        <resource-root path="mysql-connector-j-9.7.0.jar"/>
+    </resources>
+
+    <dependencies>
+        <!-- XA / 2PC: MysqlXADataSource が jakarta.transaction を利用する -->
+        <module name="jakarta.transaction.api"/>
+        <!-- java.sql (JDBC API) は JDK 提供モジュールとして自動的に可視 -->
+    </dependencies>
+
+</module>
