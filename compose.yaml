@@ -63,6 +63,17 @@ services:
       TX_NODE_ID: front-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890
+    # コンテナのルートFSを読み取り専用にする (セキュリティ強化)。
+    # /mnt/logs, /mnt/data は下の named volume マウントなので read_only でも書き込み可能
+    # (マウント先は read_only の対象外)。一方 JBoss EAP は ${JBOSS_HOME}/standalone 配下へ
+    # 実行時に書き込むため、entrypoint.sh がルートFS読み取り専用を検知したときだけ
+    # 書き込み可能な tmpfs (/tmp) へ standalone を複製して JBOSS_BASE_DIR を向ける。
+    # 注記: ECS taskdef は readOnlyRootFilesystem を設定していないため、これはローカル
+    # compose 独自のハードニング。entrypoint 側は書き込み可能FSでは何もしない (挙動不変)。
+    read_only: true
+    tmpfs:
+      # JBoss/Java の一時領域および読み取り専用ルートFS時の standalone 複製先
+      - /tmp
     # 偽装 EFS (named volume)。実 ECS では EFS ボリューム (アクセスポイント不使用) を
     # 同じパスにマウントする。コンテナは jboss (UID 185) で動くため、GID 6302 を
     # 補助グループに追加してマウントポイント (6301:6302, mode 2775) へ書き込む
@@ -122,6 +133,12 @@ services:
       TX_NODE_ID: back-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-2345678901
+    # コンテナのルートFSを読み取り専用にする (front と同じハードニング)。
+    # /mnt/logs, /mnt/data は named volume なので read_only でも書き込み可能。
+    # JBoss の standalone 配下は entrypoint.sh が tmpfs へ複製する (詳細は app-front 参照)。
+    read_only: true
+    tmpfs:
+      - /tmp
     # 偽装 EFS (named volume)。front と同じ 2 マウントポイントを共有する
     volumes:
       - efs-logs:/mnt/logs

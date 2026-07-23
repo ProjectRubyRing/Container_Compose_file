@@ -86,6 +86,28 @@ if [[ -d "${EFS_DATA_DIR}" ]]; then
   fi
 fi
 
+# --- 読み取り専用ルートFS (read_only: true) への対応 --------------------------
+# JBoss EAP は起動時に ${JBOSS_HOME}/standalone 配下 (data/tmp/log/configuration/
+# deployments) へ書き込むため、コンテナのルートFSが読み取り専用だと起動できない。
+# /mnt/logs, /mnt/data は書き込み可能な named volume なので影響を受けない
+# (「マウント先だから書ける」は正しい) が、standalone 配下は別に書き込み先が要る。
+# ルートFSが読み取り専用のとき (= standalone に書けないとき) のみ、書き込み可能な
+# tmpfs へ standalone を複製し JBOSS_BASE_DIR をそこへ向ける。standalone.sh は
+# この環境変数を尊重し、data/tmp/log/configuration/deployments・ブートログの
+# すべてを複製先 (書き込み可能) へ解決する。
+# ルートFSが書き込み可能な環境 (ECS taskdef は readOnlyRootFilesystem 未設定) では
+# 何もせず従来どおり ${JBOSS_HOME}/standalone を使う (挙動は不変)。
+if ( : > "${JBOSS_HOME}/standalone/.writable-probe" ) 2>/dev/null; then
+  rm -f "${JBOSS_HOME}/standalone/.writable-probe"
+  log "root filesystem is writable; using ${JBOSS_HOME}/standalone as-is"
+else
+  JBOSS_BASE_DIR="${JBOSS_BASE_DIR:-/tmp/jboss/standalone}"
+  log "root filesystem is read-only; relocating writable JBoss server dir to ${JBOSS_BASE_DIR}"
+  mkdir -p "${JBOSS_BASE_DIR}"
+  cp -a "${JBOSS_HOME}/standalone/." "${JBOSS_BASE_DIR}/"
+  export JBOSS_BASE_DIR
+fi
+
 # --- JBoss EAP を exec で起動 (シグナルを直接受けるため exec 必須) ------------
 exec "${JBOSS_HOME}/bin/standalone.sh" \
   -b 0.0.0.0 \
