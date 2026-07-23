@@ -64,12 +64,50 @@ export JAVA_OPTS_APPEND="${JAVA_OPTS_APPEND:-}"
 TX_NODE_ID="${TX_NODE_ID:-front-$(hostname)}"
 log "transaction node-identifier=${TX_NODE_ID}"
 
+EFS_LOG_DIR="${EFS_LOG_DIR:-/mnt/logs}"
+EFS_DATA_DIR="${EFS_DATA_DIR:-/mnt/data}"
+
+# --- EFS 上のサブディレクトリを group-writable (setgid) で用意 -----------------
+# 背景: /mnt/logs, /mnt/data は efs-mock が mode 2775 (setgid) で初期化済みだが、
+# その配下へ mkdir する際、新規ディレクトリのパーミッションはプロセスの umask で決まる。
+# 既定の umask 0022 では group の write ビットが落ち (setgid だけ親から継承されて 2755
+# 相当になる)、GID 6302 を共有する別プロセス/別コンテナが、作成済みディレクトリの配下へ
+# さらにディレクトリ/ファイルを作成できなくなる。
+# 対処: umask を 0002 にしてから作成する。この umask は exec 先の JBoss にも継承されるため、
+# JBoss が実行時に /mnt/logs 配下へ作るディレクトリ/ファイルも group-writable になる。
+# 併せて生成済みディレクトリへ明示的に mode 2775 を付与し、冪等に修復する。
+umask 0002
+
+# setgid + group-write (2775) を保証しつつ冪等にディレクトリを作成する
+ensure_shared_dir() {
+  local dir="$1"
+  if ! mkdir -p "${dir}" 2>/dev/null; then
+    log "WARN: cannot create ${dir} (uid=$(id -u) groups=$(id -G))"
+    return 0
+  fi
+  # mode の強制は所有者のみ可能。別ユーザ所有なら既存権限を尊重し警告に留める
+  chmod 2775 "${dir}" 2>/dev/null \
+    || log "WARN: cannot chmod 2775 ${dir} (owner=$(stat -c '%U:%G' "${dir}" 2>/dev/null))"
+}
+
+# 役割別サブディレクトリ (例: /mnt/logs/front/logs)。環境変数で上書き可能
+EFS_ROLE_LOG_DIR="${EFS_ROLE_LOG_DIR:-${EFS_LOG_DIR}/front/logs}"
+EFS_ROLE_DATA_DIR="${EFS_ROLE_DATA_DIR:-${EFS_DATA_DIR}/front}"
+if [[ -d "${EFS_LOG_DIR}" ]]; then
+  # 中間ディレクトリ (/mnt/logs/front) も含め各階層を 2775 で確実に整える
+  ensure_shared_dir "${EFS_LOG_DIR}/front"
+  ensure_shared_dir "${EFS_ROLE_LOG_DIR}"
+  log "EFS role log dir ready: ${EFS_ROLE_LOG_DIR} (mode=$(stat -c '%a %U:%G' "${EFS_ROLE_LOG_DIR}" 2>/dev/null))"
+fi
+if [[ -d "${EFS_DATA_DIR}" ]]; then
+  ensure_shared_dir "${EFS_ROLE_DATA_DIR}"
+  log "EFS role data dir ready: ${EFS_ROLE_DATA_DIR} (mode=$(stat -c '%a %U:%G' "${EFS_ROLE_DATA_DIR}" 2>/dev/null))"
+fi
+
 # --- EFS マウントポイント (/mnt/logs, /mnt/data) への書き込み検証 --------------
 # ECS では EFS (アクセスポイント不使用)、ローカル compose では efs-mock が初期化した
 # named volume がマウントされる想定。マウントされていない環境では検証をスキップする。
 # /mnt/logs への書き込みは cwagent のファイル検知トリガーも兼ねる。
-EFS_LOG_DIR="${EFS_LOG_DIR:-/mnt/logs}"
-EFS_DATA_DIR="${EFS_DATA_DIR:-/mnt/data}"
 EFS_MARKER="$(date -u '+%Y-%m-%dT%H:%M:%SZ') [app-front] startup uid=$(id -u) gid=$(id -g) groups=$(id -G) host=$(hostname)"
 if [[ -d "${EFS_LOG_DIR}" ]]; then
   if echo "${EFS_MARKER}" >> "${EFS_LOG_DIR}/app-front.log" 2>/dev/null; then
