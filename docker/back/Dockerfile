@@ -23,6 +23,19 @@ RUN mvn -q -B -e dependency:go-offline
 COPY back/servlet/src /build/src
 RUN mvn -q -B -e package
 
+# -----------------------------------------------------------------------------
+# TLS 検証用サーブレット (tls-probe.war) をビルドする。
+# back の JVM 自身から HTTPS の REST API (secure-api / ALB) を呼び出し、
+# JVM トラストストアによる証明書検証が成功することを確認するための WAR。
+# front/Dockerfile でも同じソース (docker/probe/) から同じ WAR をビルドしている。
+# -----------------------------------------------------------------------------
+FROM maven:3.9-eclipse-temurin-21 AS probebuild
+WORKDIR /probe
+COPY probe/pom.xml /probe/pom.xml
+RUN mvn -q -B -e dependency:go-offline
+COPY probe/src /probe/src
+RUN mvn -q -B -e package
+
 FROM ${EAP_BASE_IMAGE}
 ARG MYSQL_CONNECTOR_VERSION
 ENV JBOSS_HOME=/opt/server
@@ -49,6 +62,9 @@ COPY --chown=185:0 back/app/ ${JBOSS_HOME}/standalone/deployments/
 
 # 非同期チェーンの受け口サーブレット (コンテキストルート /async → /async/receive)
 COPY --from=warbuild --chown=185:0 /build/target/async-receiver.war ${JBOSS_HOME}/standalone/deployments/
+
+# TLS 検証用サーブレット (コンテキストルート /tls-probe → /tls-probe/check)
+COPY --from=probebuild --chown=185:0 /probe/target/tls-probe.war ${JBOSS_HOME}/standalone/deployments/
 
 COPY --chown=185:0 back/entrypoint.sh /opt/bin/entrypoint.sh
 RUN chmod 0755 /opt/bin/entrypoint.sh

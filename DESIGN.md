@@ -39,6 +39,9 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 | EFS (/mnt/logs, /mnt/data。アクセスポイント不使用) | efs-mock + named volume | UID 6301 / GID 6302, mode 2775 (setgid) で初期化。front/back は `group_add: 6302` で書き込み。ホスト側の権限変更は不要 |
 | cwagent (ログ転送) | cwagent (同一イメージ) | 設定の `logs.endpoint_override` で送信先のみ cloudwatch-logs-mock へ差し替え (認証情報はダミー) |
 | CloudWatch Logs | WireMock (cloudwatch-logs-mock) | PutLogEvents 受信スタブ。request journal で送信内容を確認 |
+| AWS Private CA (ACM PCA) / 社内 CA | pki-init (openssl) | 自己署名のルート CA → 中間 CA → 各サーバ証明書を発行し named volume で共有 |
+| 自己署名証明書で HTTPS を要求する外部 API | WireMock (secure-api, `--disable-http`) | HTTPS のみ listen。front/back は JVM トラストストアへ CA を取り込んで呼び出す。詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) |
+| ALB の HTTPS リスナー + ACM 証明書 | alb (nginx) の `listen 443 ssl` | 証明書は自己署名 / 中間 CA 発行を `./alb-tls-cert.sh` で切り替え。`/secure/*` はターゲットへ HTTPS 再暗号化 |
 
 ECS ではタスク内 localhost 通信、compose では各サービスが別ネットワーク名前空間という
 差分は、宛先をすべて環境変数 (`OTEL_EXPORTER_OTLP_ENDPOINT` / `BACK_BASE_URL` /

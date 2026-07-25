@@ -55,6 +55,107 @@ if [[ "${JAVA_TOOL_OPTIONS}" == *"-javaagent"* ]]; then
 else
   export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+${JAVA_TOOL_OPTIONS} }-javaagent:${ADOT_AGENT_JAR}"
 fi
+
+# --- 自己署名 CA / 自己署名証明書を JVM トラストストアへ取り込む ---------------
+# 目的: HTTPS を要求する REST API (secure-api / ALB HTTPS リスナー) の
+#       サーバ証明書を、アプリコードを無改変のまま検証できるようにする。
+#
+# なぜ cacerts を「コピーしてから」使うのか:
+#   コンテナは jboss (UID 185) で動くため ${JAVA_HOME}/lib/security/cacerts を
+#   直接書き換えられない (root 所有)。書き込み可能な場所へコピーして CA を足し、
+#   javax.net.ssl.trustStore でその位置を JVM に教える。
+#   コピー元は JDK 同梱の cacerts なので、パブリック CA の信頼はそのまま残る
+#   (= 自己署名 CA を「追加」するだけで、既存の信頼を壊さない)。
+#
+# なぜ JAVA_TOOL_OPTIONS か:
+#   JBoss の JAVA_OPTS_APPEND でも渡せるが、JAVA_TOOL_OPTIONS は JVM が必ず
+#   解釈するため、jboss-cli など補助 JVM からも同じトラストストアが使われる。
+#
+# 取り込む証明書: ${PKI_TRUST_DIR}/*.crt (pki-init が発行し named volume で共有)
+#   10-local-test-root-ca.crt          ルート CA         ┐ この 2 枚を入れると
+#   20-local-test-intermediate-ca.crt  中間 CA           ┘ CA 発行の証明書を全て信頼
+#   30-alb-selfsigned.crt              ALB の自己署名証明書 (その 1 枚だけを信頼)
+# ファイル名 (拡張子を除く) がそのまま keytool の alias になる。
+PKI_TRUST_DIR="${PKI_TRUST_DIR:-/mnt/pki/trust}"
+JVM_TRUSTSTORE_DIR="${JVM_TRUSTSTORE_DIR:-/tmp/pki}"
+JVM_TRUSTSTORE_FILE="${JVM_TRUSTSTORE_FILE:-${JVM_TRUSTSTORE_DIR}/cacerts}"
+# コピー元 cacerts のパスワード (JDK 既定値。テスト環境のため既定のまま使う)
+JVM_TRUSTSTORE_PASSWORD="${JVM_TRUSTSTORE_PASSWORD:-changeit}"
+# true にすると取り込みに失敗した時点で起動を中止する (既定は警告のみで続行)
+TRUSTSTORE_IMPORT_REQUIRED="${TRUSTSTORE_IMPORT_REQUIRED:-false}"
+
+# JDK 同梱 cacerts の場所を探す (ディストリビューションによって位置が異なる)
+find_source_cacerts() {
+  local java_bin candidates=()
+  [[ -n "${JAVA_HOME:-}" ]] && candidates+=("${JAVA_HOME}/lib/security/cacerts")
+  candidates+=("/etc/pki/java/cacerts")
+  if java_bin="$(command -v java 2>/dev/null)"; then
+    candidates+=("$(dirname "$(dirname "$(readlink -f "${java_bin}")")")/lib/security/cacerts")
+  fi
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -r "${c}" ]] && { echo "${c}"; return 0; }
+  done
+  return 1
+}
+
+import_trusted_certs() {
+  local src dst imported=0 failed=0 f alias
+
+  # 取り込む証明書が無ければ何もしない (pki 未マウントの環境でも起動できるように)
+  if [[ ! -d "${PKI_TRUST_DIR}" ]] || ! compgen -G "${PKI_TRUST_DIR}/*.crt" >/dev/null; then
+    log "truststore: ${PKI_TRUST_DIR} に *.crt が無いため取り込みをスキップします"
+    return 0
+  fi
+
+  if ! command -v keytool >/dev/null 2>&1; then
+    log "WARN: keytool が見つからないためトラストストアへの取り込みをスキップします"
+    [[ "${TRUSTSTORE_IMPORT_REQUIRED}" == "true" ]] && fail "keytool not found"
+    return 0
+  fi
+
+  if ! src="$(find_source_cacerts)"; then
+    log "WARN: JDK 同梱の cacerts が見つかりません"
+    [[ "${TRUSTSTORE_IMPORT_REQUIRED}" == "true" ]] && fail "source cacerts not found"
+    return 0
+  fi
+
+  dst="${JVM_TRUSTSTORE_FILE}"
+  mkdir -p "$(dirname "${dst}")"
+  # 毎起動でコピーし直す = alias 重複エラーが起きず、常に最新の CA が反映される
+  cp -f "${src}" "${dst}"
+  chmod 0600 "${dst}"
+  log "truststore: ${src} → ${dst} にコピーしました"
+
+  for f in "${PKI_TRUST_DIR}"/*.crt; do
+    [[ -e "${f}" ]] || continue
+    alias="$(basename "${f}" .crt)"
+    if keytool -importcert -noprompt -trustcacerts \
+         -alias "${alias}" -file "${f}" \
+         -keystore "${dst}" -storepass "${JVM_TRUSTSTORE_PASSWORD}" >/dev/null 2>&1; then
+      log "truststore: imported alias=${alias} subject=$(openssl x509 -in "${f}" -noout -subject 2>/dev/null | sed 's/^subject=//' || echo '(openssl 無し)')"
+      imported=$((imported + 1))
+    else
+      log "WARN: truststore import failed: alias=${alias} file=${f}"
+      failed=$((failed + 1))
+    fi
+  done
+
+  if (( imported == 0 )); then
+    log "WARN: 1 件も取り込めませんでした (HTTPS 呼び出しは失敗します)"
+    [[ "${TRUSTSTORE_IMPORT_REQUIRED}" == "true" ]] && fail "no certificate imported into truststore"
+    return 0
+  fi
+
+  # JVM 全体へトラストストアを指定する。
+  # trustStoreType は指定しない (JKS/PKCS12 は JDK が自動判別するため、
+  # 明示するとコピー元の形式が変わったときに読めなくなる)。
+  export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+${JAVA_TOOL_OPTIONS} }-Djavax.net.ssl.trustStore=${dst} -Djavax.net.ssl.trustStorePassword=${JVM_TRUSTSTORE_PASSWORD}"
+  log "truststore: ready (imported=${imported} failed=${failed}) path=${dst}"
+}
+
+import_trusted_certs
+
 log "JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}"
 
 # --- ヒープ等の追加 JVM オプション (JBoss 標準の JAVA_OPTS_APPEND を利用) -----

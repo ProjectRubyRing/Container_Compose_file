@@ -16,6 +16,19 @@ ARG MYSQL_CONNECTOR_VERSION=9.7.0
 # --- Stage 1: ADOT Java Agent (公式配布イメージから jar のみ取得) -------------
 FROM public.ecr.aws/aws-observability/adot-autoinstrumentation-java:${ADOT_JAVA_AGENT_VERSION} AS adot
 
+# -----------------------------------------------------------------------------
+# Stage 1b: TLS 検証用サーブレット (tls-probe.war) をビルドする。
+# front の JVM 自身から HTTPS の REST API (secure-api / ALB) を呼び出し、
+# JVM トラストストアによる証明書検証が成功することを確認するための WAR。
+# back/Dockerfile でも同じソースから同じ WAR をビルドして配備している。
+# -----------------------------------------------------------------------------
+FROM maven:3.9-eclipse-temurin-21 AS probebuild
+WORKDIR /probe
+COPY probe/pom.xml /probe/pom.xml
+RUN mvn -q -B -e dependency:go-offline
+COPY probe/src /probe/src
+RUN mvn -q -B -e package
+
 # --- Stage 2: 本体 -------------------------------------------------------------
 FROM ${EAP_BASE_IMAGE}
 ARG MYSQL_CONNECTOR_VERSION
@@ -46,6 +59,9 @@ RUN "${JBOSS_HOME}/bin/jboss-cli.sh" --file=/tmp/config.cli \
 
 # アプリケーション WAR を配備 (アプリコードは無改変。front/app/ に WAR を置く)
 COPY --chown=185:0 front/app/ ${JBOSS_HOME}/standalone/deployments/
+
+# TLS 検証用サーブレット (コンテキストルート /tls-probe → /tls-probe/check)
+COPY --from=probebuild --chown=185:0 /probe/target/tls-probe.war ${JBOSS_HOME}/standalone/deployments/
 
 # Entrypoint
 COPY --chown=185:0 front/entrypoint.sh /opt/bin/entrypoint.sh

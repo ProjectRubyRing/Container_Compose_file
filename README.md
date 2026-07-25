@@ -9,10 +9,13 @@ compose.yaml                         # ローカル検証用 compose (Jaeger を
 DESIGN.md                            # 設計判断の根拠・デプロイ手順・トラブルシューティング
 docs/ASYNC-SQS-LAMBDA-ALB.md         # 非同期チェーン (SQS→Lambda→ALB→app-back) 詳細ガイド
 docs/MYSQL-8.4-AURORA-UPGRADE.md     # Aurora 8.4 / MySQL 8.4.7 化・Connector/J 9.7.0 の詳細解説
+docs/TLS-SELF-SIGNED-ALB.md          # 自己署名証明書 HTTPS / JVM トラストストア / ALB 証明書の詳細ガイド
 .env.example                         # compose 用環境変数の雛形 (→ .env にコピー)
 verify-local.sh                      # ローカル動作確認スクリプト
 verify-async.sh                      # 非同期チェーンの動作確認スクリプト
+verify-tls.sh                        # 自己署名証明書 HTTPS 経路の動作確認スクリプト
 alb-maintenance.sh                   # ALB 全面メンテナンスモードの ON/OFF 切り替え
+alb-tls-cert.sh                      # ALB HTTPS リスナーの証明書切り替え (自己署名 / 中間CA発行)
 compose/
   otel/adot-collector-local.yaml     # ADOT Collector ローカル設定 (debug + Jaeger 出力)
   mysql/init.sql                     # appdb: XA_RECOVER_ADMIN 付与ほか初期化
@@ -24,8 +27,13 @@ compose/
   sqs/elasticmq.conf                 # SQS のローカル代替 (ElasticMQ) キュー/DLQ 設定
   lambda/app/handler.py              # Lambda 関数 (SQS→ALB→app-back を POST 呼び出し)
   lambda-esm/poller.py, Dockerfile   # SQS イベントソースマッピングの代替 (poller)
-  alb/nginx.conf                     # ALB のローカル代替 (nginx L7 ルーティング)
+  alb/nginx.conf                     # ALB のローカル代替 (nginx L7 ルーティング / HTTP:80 + HTTPS:443)
   alb/rules/                         # ALB リスナールール (★差し替え可能★, variants/ に切り替えソース)
+  alb/rules-tls/                     # HTTPS リスナーのルール (★差し替え可能★)
+  alb/tls/                           # HTTPS リスナーに適用する証明書 (★差し替え可能★, variants/ あり)
+  pki/gen-certs.sh, Dockerfile       # 自己署名 PKI 発行 (ルートCA→中間CA→サーバ証明書)
+  secure-api/mappings/               # HTTPS 専用 REST API (WireMock) のスタブ
+  tls-verifier/verify-tls.sh, Dockerfile # TLS 経路の検証コンテナ (compose ネットワーク内から実行)
   maintenance-lambda/app/maintenance.py  # メンテナンス画面 Lambda (★差し替え可能★, 画面HTML+503)
   alb-lambda-adapter/adapter.py      # ALB の Lambda ターゲット統合 (HTTP↔Lambda 変換) の代替
 docker/
@@ -34,6 +42,7 @@ docker/
   front/Dockerfile, entrypoint.sh    # フロントコンテナ (HTTP 8080)
   back/Dockerfile,  entrypoint.sh    # バックコンテナ (HTTP 8180 = port-offset 100)
   back/servlet/                      # 非同期チェーン受け口の Java サーブレット WAR (Maven)
+  probe/                             # TLS 検証用サーブレット WAR (front/back 両方に配備)
   front/app/, back/app/              # ここに WAR を置く (アプリコード無改変)
 ecs/
   taskdef.json                       # Fargate タスク定義 (front/back/ADOT/CW Agent 4 コンテナ)
@@ -87,6 +96,42 @@ curl -i http://localhost:9080/maintenance   # 常時: メンテナンス画面�
 メンテ Lambda `:9001` / ALB `:9080` / adapter `:9081`
 
 **実装・設定方法の詳細は [docs/ASYNC-SQS-LAMBDA-ALB.md](docs/ASYNC-SQS-LAMBDA-ALB.md) を参照。**
+
+## 自己署名証明書による HTTPS 検証 (secure-api / JVM トラストストア / ALB)
+
+自己署名 CA で発行した証明書でのみ HTTPS を受け付ける REST API サーバを追加し、
+**front/back の JVM トラストストアへ CA (または自己署名証明書そのもの) を取り込むことで、
+アプリコードを無改変のまま REST API を呼び出せる**ことを検証する。ALB 経由も同様に検証できる。
+
+```bash
+docker compose up -d --build
+./verify-tls.sh                 # 一括検証 (コンテナ内 + ホストから)
+./verify-tls.sh quick           # JVM 経路のみ (短時間)
+```
+
+- `pki-init` が **ルート CA (自己署名) → 中間 CA → 各サーバ証明書** を発行し、named volume で全コンテナへ配る
+- `secure-api` (WireMock, `--disable-http`) が **HTTPS でのみ** REST API を提供 (`:8543`)
+- `app-front` / `app-back` の entrypoint が `keytool` で **JDK 同梱 cacerts のコピーへ CA を追加**し、
+  `-Djavax.net.ssl.trustStore` で JVM に指定する (パブリック CA の信頼は残したまま追加)
+- `tls-probe.war` を front/back 両方に配備し、**その JVM 自身から** HTTPS 呼び出しを実行して確認できる
+- `alb` に **HTTPS リスナー (`:9443`)** を追加。`/secure/*` は secure-api へ HTTPS 再暗号化で転送
+
+```bash
+# front の JVM から secure-api を直接 / ALB 経由で呼ぶ
+curl -s "http://localhost:8080/tls-probe/check?target=direct" | jq .
+curl -s "http://localhost:8180/tls-probe/check?target=alb"    | jq .
+curl -s  http://localhost:8080/tls-probe/truststore           | jq .   # 取り込み済み証明書
+
+# ALB の証明書を切り替える (自己署名 ⇄ 中間 CA 発行)。reload のみで即時反映
+./alb-tls-cert.sh selfsigned | ca-issued | status
+```
+
+「自己証明書そのものをインポートする」「中間 CA 証明書をインポートする」の
+**両パターンを同時に検証できる**よう、ALB 用に自己署名リーフと中間 CA 発行の 2 種類を発行している。
+
+ポート: secure-api `:8543` (HTTPS) / ALB HTTPS リスナー `:9443`
+
+**実装・設定方法の詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) を参照。**
 
 ## EFS / CloudWatch Logs 転送の偽装
 

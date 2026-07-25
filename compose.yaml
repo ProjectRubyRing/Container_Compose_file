@@ -21,6 +21,15 @@
 #                               (実 CloudWatch Logs には送信しない)
 #   cloudwatch-logs-mock      → CloudWatch Logs API のスタブ (WireMock)。cwagent からの
 #                               PutLogEvents を受信し、request journal で送信内容を確認
+#   pki-init                  → AWS Private CA (ACM PCA) / 社内 CA の代替。自己署名の
+#                               ルート CA → 中間 CA → 各サーバ証明書を発行し、named
+#                               volume (pki) で全コンテナへ配る
+#   secure-api                → 自己署名証明書で HTTPS のみを受け付ける REST API サーバ
+#                               (WireMock を --disable-http で起動)。front/back は
+#                               JVM トラストストアへ CA を取り込んで呼び出す
+#   alb の HTTPS リスナー      → ACM 証明書を適用した ALB の HTTPS リスナーの代替。
+#                               証明書は自己署名 / 中間 CA 発行を切り替えられる
+#   tls-verifier              → 上記 TLS 経路を機械的に検証する (profiles: verify)
 #
 # ECS では同一タスク内 localhost 通信だが、compose では各サービスが別ネットワーク
 # 名前空間のため、宛先を環境変数 (OTEL_EXPORTER_OTLP_ENDPOINT / BACK_BASE_URL 等)
@@ -63,12 +72,21 @@ services:
       TX_NODE_ID: front-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890
+      # --- 自己署名証明書による HTTPS 検証 -----------------------------------
+      # entrypoint.sh がこのディレクトリの *.crt を keytool で JVM トラストストアへ
+      # 取り込み、-Djavax.net.ssl.trustStore で JVM に指定する
+      PKI_TRUST_DIR: /mnt/pki/trust
+      # tls-probe サーブレットの既定の呼び出し先 (GET /tls-probe/check?target=...)
+      SECURE_API_URL: https://secure-api:8443/api/v1/ping          # target=direct
+      SECURE_API_VIA_ALB_URL: https://alb/secure/v1/ping           # target=alb
     # 偽装 EFS (named volume)。実 ECS では EFS ボリューム (アクセスポイント不使用) を
     # 同じパスにマウントする。コンテナは jboss (UID 185) で動くため、GID 6302 を
     # 補助グループに追加してマウントポイント (6301:6302, mode 2775) へ書き込む
     volumes:
       - efs-logs:/mnt/logs
       - efs-data:/mnt/data
+      # pki-init が発行した証明書一式 (読み取り専用でよい)
+      - pki:/mnt/pki:ro
     group_add:
       - "6302"
     depends_on:
@@ -77,12 +95,22 @@ services:
       mysql:
         condition: service_healthy
       valkey:
-        condition: service_started
+        condition: service_healthy
+      # app-back は起動開始のみを待つ。EAP の起動完了 (healthy) まで待つ場合は
+      # service_healthy に変更するが、back の start_period が 120s のため
+      # front の起動開始が 2〜3 分遅れる点に注意する。
       app-back:
         condition: service_started
+      # WireMock は JVM 起動のため、コンテナ起動から HTTP listen 開始まで数秒〜数十秒かかる。
+      # service_started だと listen 前に EAP と ADOT Java Agent が
+      # ECS_CONTAINER_METADATA_URI_V4 を叩き、タスク ID の取得に失敗する。
       ecs-metadata-mock:
-        condition: service_started
+        condition: service_healthy
       efs-mock:
+        condition: service_healthy
+      # 証明書の発行完了を待つ。起動前に *.crt が揃っていないと
+      # entrypoint のトラストストア取り込みが空振りする
+      pki-init:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8080/ >/dev/null || exit 1"]
@@ -122,10 +150,15 @@ services:
       TX_NODE_ID: back-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-2345678901
+      # --- 自己署名証明書による HTTPS 検証 (front と同一設定) ---------------
+      PKI_TRUST_DIR: /mnt/pki/trust
+      SECURE_API_URL: https://secure-api:8443/api/v1/ping          # target=direct
+      SECURE_API_VIA_ALB_URL: https://alb/secure/v1/ping           # target=alb
     # 偽装 EFS (named volume)。front と同じ 2 マウントポイントを共有する
     volumes:
       - efs-logs:/mnt/logs
       - efs-data:/mnt/data
+      - pki:/mnt/pki:ro
     group_add:
       - "6302"
     depends_on:
@@ -134,12 +167,17 @@ services:
       mysql:
         condition: service_healthy
       valkey:
-        condition: service_started
+        condition: service_healthy
+      # WireMock (svf-mock / ecs-metadata-mock) は listen 開始まで待つ必要がある。
+      # service_started だと EAP のデプロイ処理が listen 前に走って失敗しうる。
       svf-mock:
-        condition: service_started
+        condition: service_healthy
       ecs-metadata-mock:
-        condition: service_started
+        condition: service_healthy
       efs-mock:
+        condition: service_healthy
+      # 証明書の発行完了を待つ (front と同じ理由)
+      pki-init:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fs http://127.0.0.1:8180/ >/dev/null || exit 1"]
@@ -169,8 +207,9 @@ services:
     depends_on:
       jaeger:
         condition: service_started
+      # resourcedetection/ecs 検出器が起動時にモックを参照するため、listen 完了を待つ
       ecs-metadata-mock:
-        condition: service_started
+        condition: service_healthy
 
   # X-Ray コンソールのローカル代替 (OTLP 受信 + トレース可視化 UI)
   jaeger:
@@ -202,11 +241,18 @@ services:
     ports:
       - "3306:3306"
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
-      interval: 10s
+      # mysqladmin ping は「サーバが応答したこと」しか見ておらず、認証エラー
+      # (ER_ACCESS_DENIED) でも成功を返すため、アプリが実際に使えるかは分からない。
+      # front/back が使う appuser / appdb で SELECT できることまで検証する。
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" -D\"$$MYSQL_DATABASE\" -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      # 猶予は start_period 20s + 5s x 60 = 約 320 秒。
+      # 旧設定 (約 130 秒) では、volume を削除した後のコールド初期化
+      # (initdb + 10-init.sql + 20-init-infdb.sh) が他コンテナと CPU を奪い合うと
+      # 間に合わず、compose が dependency failed to start で up 全体を中断していた。
+      retries: 60
+      start_period: 20s
 
   # ElastiCache for Valkey のローカル代替
   valkey:
@@ -214,6 +260,12 @@ services:
     container_name: valkey
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
 
   # SVF 帳票サーバ (ALB 経由 REST) のローカル代替スタブ
   svf-mock:
@@ -223,6 +275,15 @@ services:
       - ./compose/svf-mock/mappings:/home/wiremock/mappings:ro
     ports:
       - "8280:8080"
+    healthcheck:
+      # WireMock (JVM) の HTTP listen 開始を healthy 条件にする。
+      # イメージに curl が無い場合も動くよう、bash の /dev/tcp で TCP 接続だけを確認する
+      # (curl があれば "curl -fsS http://127.0.0.1:8080/__admin/health" でもよい)。
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
 
   # ECS Task Metadata Endpoint v4 (ECS_CONTAINER_METADATA_URI_V4) のローカル代替スタブ
   # GET /v4/<container-id>       → コンテナメタデータ (Fargate 実応答相当)
@@ -235,6 +296,14 @@ services:
       - ./compose/ecs-metadata-mock/mappings:/home/wiremock/mappings:ro
     ports:
       - "8380:8080"  # 例: curl http://localhost:8380/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890/task
+    healthcheck:
+      # app-front / app-back / adot-collector がこのモックを起動時に参照するため、
+      # HTTP listen 開始を healthy 条件にして依存側を service_healthy で待たせる。
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
 
   # ---------------------------------------------------------------------------
   # EFS のローカル代替 (アクセスポイントは使わず、マウントポイントのみ利用する想定)
@@ -287,8 +356,9 @@ services:
     depends_on:
       efs-mock:
         condition: service_healthy
+      # 送信先 WireMock の listen 完了まで待つ (未 listen だと初回送信が捨てられる)
       cloudwatch-logs-mock:
-        condition: service_started
+        condition: service_healthy
 
   # CloudWatch Logs API のローカル代替スタブ (cwagent の「送信の偽装」先)
   # CreateLogGroup / CreateLogStream / PutLogEvents を 200 で受けるだけで実送信はしない。
@@ -303,6 +373,12 @@ services:
       - ./compose/cloudwatch-logs-mock/mappings:/home/wiremock/mappings:ro
     ports:
       - "8480:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
 
   # ===========================================================================
   # 非同期処理チェーン (SQS → Lambda → ALB → app-back)
@@ -386,20 +462,134 @@ services:
     container_name: alb
     volumes:
       - ./compose/alb/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./compose/alb/rules:/etc/nginx/rules:ro   # リスナールール群 (差し替え可能)
+      - ./compose/alb/rules:/etc/nginx/rules:ro   # HTTP リスナールール群 (差し替え可能)
+      # --- HTTPS リスナー (:443) 用 -----------------------------------------
+      - ./compose/alb/rules-tls:/etc/nginx/rules-tls:ro  # HTTPS リスナールール群 (差し替え可能)
+      - ./compose/alb/tls:/etc/nginx/tls:ro              # 適用するサーバ証明書の指定 (差し替え可能)
+      - pki:/pki:ro                                      # 証明書の実体 (pki-init が発行)
     ports:
-      - "9080:80"   # ホストから ALB 経由の疎通確認用 (http://localhost:9080/async/receive)
+      - "9080:80"    # ホストから ALB 経由の疎通確認用 (http://localhost:9080/async/receive)
+      - "9443:443"   # HTTPS リスナー (https://localhost:9443/secure/v1/ping)
     depends_on:
       app-back:
         condition: service_started
       alb-lambda-adapter:
         condition: service_started
+      # ssl_certificate のファイルが無いと nginx は起動に失敗するため必ず待つ
+      pki-init:
+        condition: service_healthy
+      # HTTPS ターゲットグループ (再暗号化先)
+      secure-api:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 5s
+
+  # ===========================================================================
+  # 自己署名証明書による HTTPS 検証 (pki-init / secure-api / tls-verifier)
+  # ---------------------------------------------------------------------------
+  #   pki-init      → 自己署名のルート CA・中間 CA・サーバ証明書を発行し
+  #                   named volume (pki) で全コンテナへ配る
+  #   secure-api    → HTTPS でのみ待ち受ける REST API サーバ (WireMock)
+  #   app-front/back→ entrypoint が CA / 自己署名証明書を JVM トラストストアへ取り込む
+  #   alb           → HTTPS リスナー (:443) に証明書を適用し /secure/* を
+  #                   secure-api へ HTTPS で再暗号化して転送
+  #   tls-verifier  → 上記を機械的に検証する (docker compose run --rm tls-verifier)
+  #
+  # 詳細は docs/TLS-SELF-SIGNED-ALB.md を参照。
+  # ===========================================================================
+
+  # --- 自己署名 PKI の発行 ---------------------------------------------------
+  # ルート CA (自己署名) → 中間 CA → 各サーバ証明書 を発行して named volume に置く。
+  # 生成は冪等 (2 回目以降は再利用)。作り直したいときは:
+  #   docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot
+  #   もしくは docker compose down -v で volume ごと削除
+  pki-init:
+    build:
+      context: ./compose/pki
+      dockerfile: Dockerfile
+    container_name: pki-init
+    environment:
+      PKI_ROOT: /pki
+      PKI_DAYS_CA: "3650"          # CA の有効期間 (日)
+      PKI_DAYS_LEAF: "825"         # サーバ証明書の有効期間 (日)
+      PKI_KEYSTORE_PASSWORD: changeit   # secure-api 用 PKCS#12 のパスワード (テスト用)
+      PKI_FORCE_REGENERATE: "0"    # "1" で毎起動時に作り直す
+    volumes:
+      - pki:/pki
+    healthcheck:
+      # 生成完了マーカーと、各コンテナが実際に参照するファイルの存在を確認する
+      test: ["CMD-SHELL", "test -f /pki/.pki-ready && test -f /pki/secure-api/server.p12 && test -f /pki/alb/selfsigned/server.key && test -f /pki/trust/10-local-test-root-ca.crt"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+
+  # --- HTTPS を要求する REST API サーバ --------------------------------------
+  # WireMock を HTTPS 専用 (--disable-http) で起動する。
+  # サーバ証明書は pki-init が発行した中間 CA 発行の証明書を PKCS#12 で渡す。
+  # 平文 HTTP のポートは listen しないため、呼び出し側は必ず TLS を張る必要がある。
+  #   GET  https://secure-api:8443/api/v1/ping
+  #   GET  https://secure-api:8443/api/v1/items/{id}
+  #   POST https://secure-api:8443/api/v1/orders
+  #   GET  https://secure-api:8443/health        (ALB ヘルスチェック相当)
+  secure-api:
+    image: wiremock/wiremock:3.13.0
+    container_name: secure-api
+    command:
+      - --https-port=8443
+      - --https-keystore=/pki/secure-api/server.p12
+      - --keystore-type=PKCS12
+      - --keystore-password=changeit
+      - --key-manager-password=changeit
+      - --disable-http           # ← これにより「HTTPS を要求する」サーバになる
+      - --verbose
+    volumes:
+      - ./compose/secure-api/mappings:/home/wiremock/mappings:ro
+      - pki:/pki:ro
+    ports:
+      - "8543:8443"   # ホストからの確認用: curl --cacert <CA> https://localhost:8543/api/v1/ping
+    depends_on:
+      pki-init:
+        condition: service_healthy
+    healthcheck:
+      # TLS ハンドシェイクを伴わない TCP 接続確認 (イメージに curl/openssl が無くても動く)
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8443' || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  # --- 検証コンテナ ----------------------------------------------------------
+  # 常時起動は不要なので profiles で通常の up からは除外する。実行方法:
+  #   docker compose run --rm tls-verifier          (全項目)
+  #   docker compose run --rm tls-verifier quick    (JVM 経路のみ)
+  #   ./verify-tls.sh                                (ホストからの確認も含めて実行)
+  tls-verifier:
+    build:
+      context: ./compose/tls-verifier
+      dockerfile: Dockerfile
+    container_name: tls-verifier
+    profiles: ["verify"]
+    environment:
+      PKI_DIR: /pki
+      SECURE_API_HOST: secure-api
+      SECURE_API_PORT: "8443"
+      ALB_HOST: alb
+      ALB_HTTPS_PORT: "443"
+      FRONT_PROBE: http://app-front:8080/tls-probe
+      BACK_PROBE: http://app-back:8180/tls-probe
+      WAIT_SECONDS: "180"
+    volumes:
+      - pki:/pki:ro
+    depends_on:
+      pki-init:
+        condition: service_healthy
+      secure-api:
+        condition: service_healthy
 
   # --- メンテナンス画面用 Lambda のローカル代替 (RIE + maintenance.py) --------
   # ALB のリスナールールから呼ばれ、メンテナンス画面 (HTML) とステータスコード
@@ -441,3 +631,7 @@ volumes:
   # ホスト側のユーザ/権限設定に依存せず UID 6301 / GID 6302 を維持できる
   efs-logs:
   efs-data:
+  # 自己署名 PKI (CA / サーバ証明書 / 秘密鍵) の実体。pki-init が書き込み、
+  # 他コンテナは読み取り専用でマウントする。作り直しは docker compose down -v
+  # もしくは docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init
+  pki:

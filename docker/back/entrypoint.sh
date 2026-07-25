@@ -54,6 +54,87 @@ if [[ "${JAVA_TOOL_OPTIONS}" == *"-javaagent"* ]]; then
 else
   export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+${JAVA_TOOL_OPTIONS} }-javaagent:${ADOT_AGENT_JAR}"
 fi
+
+# --- 自己署名 CA / 自己署名証明書を JVM トラストストアへ取り込む ---------------
+# 詳細な意図は front/entrypoint.sh の同ブロックのコメントを参照 (両者は同一処理)。
+#   - jboss(185) は ${JAVA_HOME}/lib/security/cacerts を書き換えられないため、
+#     書き込み可能な場所へコピーしてから CA を追加し、
+#     -Djavax.net.ssl.trustStore で JVM に位置を教える
+#   - 取り込む証明書は pki-init が named volume で配る ${PKI_TRUST_DIR}/*.crt
+#     (ルート CA / 中間 CA / ALB の自己署名証明書)
+PKI_TRUST_DIR="${PKI_TRUST_DIR:-/mnt/pki/trust}"
+JVM_TRUSTSTORE_DIR="${JVM_TRUSTSTORE_DIR:-/tmp/pki}"
+JVM_TRUSTSTORE_FILE="${JVM_TRUSTSTORE_FILE:-${JVM_TRUSTSTORE_DIR}/cacerts}"
+JVM_TRUSTSTORE_PASSWORD="${JVM_TRUSTSTORE_PASSWORD:-changeit}"
+TRUSTSTORE_IMPORT_REQUIRED="${TRUSTSTORE_IMPORT_REQUIRED:-false}"
+
+find_source_cacerts() {
+  local java_bin candidates=()
+  [[ -n "${JAVA_HOME:-}" ]] && candidates+=("${JAVA_HOME}/lib/security/cacerts")
+  candidates+=("/etc/pki/java/cacerts")
+  if java_bin="$(command -v java 2>/dev/null)"; then
+    candidates+=("$(dirname "$(dirname "$(readlink -f "${java_bin}")")")/lib/security/cacerts")
+  fi
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -r "${c}" ]] && { echo "${c}"; return 0; }
+  done
+  return 1
+}
+
+import_trusted_certs() {
+  local src dst imported=0 failed=0 f alias
+
+  if [[ ! -d "${PKI_TRUST_DIR}" ]] || ! compgen -G "${PKI_TRUST_DIR}/*.crt" >/dev/null; then
+    log "truststore: ${PKI_TRUST_DIR} に *.crt が無いため取り込みをスキップします"
+    return 0
+  fi
+
+  if ! command -v keytool >/dev/null 2>&1; then
+    log "WARN: keytool が見つからないためトラストストアへの取り込みをスキップします"
+    [[ "${TRUSTSTORE_IMPORT_REQUIRED}" == "true" ]] && fail "keytool not found"
+    return 0
+  fi
+
+  if ! src="$(find_source_cacerts)"; then
+    log "WARN: JDK 同梱の cacerts が見つかりません"
+    [[ "${TRUSTSTORE_IMPORT_REQUIRED}" == "true" ]] && fail "source cacerts not found"
+    return 0
+  fi
+
+  dst="${JVM_TRUSTSTORE_FILE}"
+  mkdir -p "$(dirname "${dst}")"
+  # 毎起動でコピーし直す = alias 重複エラーが起きず、常に最新の CA が反映される
+  cp -f "${src}" "${dst}"
+  chmod 0600 "${dst}"
+  log "truststore: ${src} → ${dst} にコピーしました"
+
+  for f in "${PKI_TRUST_DIR}"/*.crt; do
+    [[ -e "${f}" ]] || continue
+    alias="$(basename "${f}" .crt)"
+    if keytool -importcert -noprompt -trustcacerts \
+         -alias "${alias}" -file "${f}" \
+         -keystore "${dst}" -storepass "${JVM_TRUSTSTORE_PASSWORD}" >/dev/null 2>&1; then
+      log "truststore: imported alias=${alias} subject=$(openssl x509 -in "${f}" -noout -subject 2>/dev/null | sed 's/^subject=//' || echo '(openssl 無し)')"
+      imported=$((imported + 1))
+    else
+      log "WARN: truststore import failed: alias=${alias} file=${f}"
+      failed=$((failed + 1))
+    fi
+  done
+
+  if (( imported == 0 )); then
+    log "WARN: 1 件も取り込めませんでした (HTTPS 呼び出しは失敗します)"
+    [[ "${TRUSTSTORE_IMPORT_REQUIRED}" == "true" ]] && fail "no certificate imported into truststore"
+    return 0
+  fi
+
+  export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+${JAVA_TOOL_OPTIONS} }-Djavax.net.ssl.trustStore=${dst} -Djavax.net.ssl.trustStorePassword=${JVM_TRUSTSTORE_PASSWORD}"
+  log "truststore: ready (imported=${imported} failed=${failed}) path=${dst}"
+}
+
+import_trusted_certs
+
 log "JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}"
 
 export JAVA_OPTS_APPEND="${JAVA_OPTS_APPEND:-}"

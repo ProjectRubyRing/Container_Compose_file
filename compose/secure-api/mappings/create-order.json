@@ -1,0 +1,19 @@
+{
+  "name": "secure-api: POST /api/v1/orders (ボディつき REST 呼び出し → 201)",
+  "request": {
+    "method": "POST",
+    "urlPath": "/api/v1/orders"
+  },
+  "response": {
+    "status": 201,
+    "headers": {
+      "Content-Type": "application/json",
+      "Location": "/api/v1/orders/ORD-0001"
+    },
+    "jsonBody": {
+      "orderId": "ORD-0001",
+      "status": "accepted",
+      "servedOver": "https"
+    }
+  }
+}

@@ -1,0 +1,38 @@
+# =============================================================================
+# 改行コードの固定
+# ---------------------------------------------------------------------------
+# このリポジトリの .sh / 設定ファイルは Linux コンテナの中で実行・読み込みされる。
+# Windows で clone すると core.autocrlf=true の既定により作業ツリーが CRLF になり、
+# コンテナ内で以下のような分かりにくい失敗を起こす:
+#   - /usr/bin/env: 'bash\r': No such file or directory  (shebang の CRLF)
+#   - nginx: [emerg] unknown directive "..."             (設定末尾の CR)
+#   - keytool/openssl に渡すパスの末尾に CR が混入して file not found
+# そのため、コンテナへ持ち込むファイルは常に LF でチェックアウトさせる。
+# =============================================================================
+
+# 既定はテキストとして正規化 (リポジトリ内は常に LF で保存)
+* text=auto eol=lf
+
+# コンテナ内で実行/読み込みされるファイルは明示的に LF 固定
+*.sh        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.conf      text eol=lf
+*.cli       text eol=lf
+*.json      text eol=lf
+*.xml       text eol=lf
+*.java      text eol=lf
+*.py        text eol=lf
+*.sql       text eol=lf
+Dockerfile  text eol=lf
+
+# 証明書・鍵はテキストだが、改行変換されると検証に失敗しうるので LF 固定
+*.crt       text eol=lf
+*.pem       text eol=lf
+*.key       text eol=lf
+
+# バイナリ (変換禁止)
+*.war       binary
+*.jar       binary
+*.p12       binary
+*.jks       binary

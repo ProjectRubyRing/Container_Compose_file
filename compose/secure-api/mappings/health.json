@@ -1,0 +1,14 @@
+{
+  "name": "secure-api: GET /health (ALB ターゲットグループの HTTPS ヘルスチェック相当)",
+  "request": {
+    "method": "GET",
+    "urlPath": "/health"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/plain"
+    },
+    "body": "secure-api healthy\n"
+  }
+}

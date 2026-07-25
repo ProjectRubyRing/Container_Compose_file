@@ -1,2 +1,6 @@
 # compose 用のローカル環境変数 (README の手順で .env.example からコピーして作成)
 .env
+
+# verify-tls.sh がホスト検証用に named volume から取り出す CA / 証明書
+# (pki-init が生成するテスト用証明書。コミットしない)
+.pki-out/

@@ -1,0 +1,20 @@
+{
+  "name": "secure-api: GET /api/v1/items/{id} (パス変数つき REST 呼び出し)",
+  "request": {
+    "method": "GET",
+    "urlPathPattern": "/api/v1/items/[0-9A-Za-z_-]+"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "itemId": "ITEM-0001",
+      "name": "secure item",
+      "price": 1200,
+      "currency": "JPY",
+      "servedOver": "https"
+    }
+  }
+}
