@@ -7,7 +7,9 @@
 #                               awsxray → debug + otlphttp(Jaeger) に差し替え
 #   jaeger                    → X-Ray コンソールの代替 (トレース可視化 UI)
 #   mysql (8.4.7)             → Aurora MySQL 8.4 (Serverless v2) + RDS Proxy の代替
-#                               (Aurora MySQL 8.4 互換のコミュニティ版 8.4.7 を使用)
+#                               (Aurora MySQL 8.4 互換のコミュニティ版 8.4.7 を使用)。
+#                               TLS は pki-init 発行の CA 発行証明書 + 平文拒否で
+#                               RDS Proxy 相当にそろえる (docs/RDS-PROXY-TLS.md)
 #   valkey                    → ElastiCache for Valkey の代替
 #   svf-mock (WireMock)       → ALB 越しの SVF 帳票サーバの代替
 #   ecs-metadata-mock         → ECS Task Metadata Endpoint v4
@@ -21,9 +23,10 @@
 #                               (実 CloudWatch Logs には送信しない)
 #   cloudwatch-logs-mock      → CloudWatch Logs API のスタブ (WireMock)。cwagent からの
 #                               PutLogEvents を受信し、request journal で送信内容を確認
-#   pki-init                  → AWS Private CA (ACM PCA) / 社内 CA の代替。自己署名の
-#                               ルート CA → 中間 CA → 各サーバ証明書を発行し、named
-#                               volume (pki) で全コンテナへ配る
+#   pki-init                  → AWS Private CA (ACM PCA) / 社内 CA / Amazon RDS CA の
+#                               代替。自己署名のルート CA → 中間 CA → 各サーバ証明書
+#                               (secure-api / ALB / MySQL) を発行し、named volume
+#                               (pki) で全コンテナへ配る
 #   secure-api                → 自己署名証明書で HTTPS のみを受け付ける REST API サーバ
 #                               (WireMock を --disable-http で起動)。front/back は
 #                               JVM トラストストアへ CA を取り込んで呼び出す
@@ -61,6 +64,11 @@ services:
       DB_NAME: appdb
       DB_USER: appuser
       DB_PASSWORD: "ChangeMe_appdb_P@ss123"   # テスト環境用ダミー値 (直書き)
+      # RDS Proxy 経由の本番と同じ検証レベル。サーバ証明書のチェーン検証に加えて
+      # 接続先ホスト名 (DB_HOST=mysql) が証明書の SAN に含まれることまで確認する。
+      # mysql コンテナは pki-init が発行した SAN=DNS:mysql の証明書を提示し、
+      # CA は entrypoint.sh が JVM トラストストアへ取り込み済み。
+      DB_SSL_MODE: VERIFY_IDENTITY
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       BACK_BASE_URL: http://app-back:8180
@@ -140,6 +148,7 @@ services:
       DB_NAME: appdb
       DB_USER: appuser
       DB_PASSWORD: "ChangeMe_appdb_P@ss123"   # テスト環境用ダミー値 (直書き)
+      DB_SSL_MODE: VERIFY_IDENTITY            # front と同一 (docs/RDS-PROXY-TLS.md)
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       SVF_BASE_URL: http://svf-mock:8080
@@ -218,13 +227,47 @@ services:
     ports:
       - "16686:16686"  # UI: http://localhost:16686
 
-  # Aurora MySQL 8.4 (Serverless v2) のローカル代替
+  # Aurora MySQL 8.4 (Serverless v2) + RDS Proxy のローカル代替
   # Aurora MySQL 3.10.x は MySQL 8.4 互換のため、コミュニティ版 8.4.7 を使用する。
   # 初期セットアップ (appdb/appuser・infdb/infuser の 2 スキーマ、XA_RECOVER_ADMIN 付与など)
   # は 8.0.42 のときと同一。8.4 系での取り扱い差分は docs/MYSQL-8.4-AURORA-UPGRADE.md を参照。
+  #
+  # TLS は下の command で RDS Proxy 相当に設定している:
+  #   - pki-init が発行した CA 発行証明書を提示 (mysqld の自己署名自動生成は OFF)
+  #   - 平文接続を拒否 (RDS Proxy の "Require Transport Layer Security" 相当)
+  # これにより front/back は本番と同じ sslMode=VERIFY_IDENTITY で接続できる。
+  # 詳細は docs/RDS-PROXY-TLS.md を参照。
   mysql:
     image: mysql:8.4.7
     container_name: mysql
+    # --- RDS Proxy 相当の TLS 設定 --------------------------------------------
+    # あえて my.cnf ではなく mysqld の起動引数で渡している。理由:
+    #   mysqld は「world-writable な設定ファイルを黙って無視する」
+    #   (mysql: [Warning] World-writable config file '...' is ignored.)。
+    #   Windows/macOS の Docker Desktop で bind mount したファイルは mode 0777 に
+    #   なるため、/etc/mysql/conf.d/*.cnf として置くと環境によって設定が「効いたり
+    #   効かなかったり」する (= ローカルでだけ TLS 設定が無視され、自己署名証明書の
+    #   自動生成に戻る)。起動引数ならホストのファイルモードに一切依存しない。
+    # 各設定の意図と背景は docs/RDS-PROXY-TLS.md を参照。
+    command:
+      # 自己署名 ca.pem / server-cert.pem の自動生成をやめる。
+      # これをしないと mysqld が自己署名 CA を作って使い、
+      #   [Warning] [MY-010068] CA certificate ca.pem is self signed.
+      # が出る (RDS Proxy では起こり得ない状態)。
+      - --auto_generate_certs=OFF
+      # pki-init が発行した CA 発行のサーバ証明書 (RDS Proxy が提示する
+      # Amazon RDS CA 発行証明書に相当)。リーフ + 中間 CA の fullchain を渡すことで
+      # クライアントへ中間 CA まで提示できる。
+      - --ssl_cert=/mnt/pki/rds-proxy/fullchain.crt
+      - --ssl_key=/mnt/pki/rds-proxy/server.key
+      # 本来はクライアント証明書の検証用だが、mysqld は起動時に自分のサーバ証明書も
+      # この CA で検証する。省略すると MY-015010 / MY-015011 の警告が出る。
+      - --ssl_ca=/mnt/pki/ca/ca-chain.crt
+      # 平文接続を拒否 (RDS Proxy の "Require Transport Layer Security" 相当)。
+      # Unix ソケットは対象外なので初期化スクリプトには影響しない。
+      - --require_secure_transport=ON
+      # 8.4.7 の既定値と同じだが、下限をサーバ側で強制することを明示しておく
+      - --tls_version=TLSv1.2,TLSv1.3
     environment:
       # テスト環境専用のためパスワードは直書き (本番の値を書かないこと)
       MYSQL_ROOT_PASSWORD: "localdev-root-change-me"
@@ -237,14 +280,24 @@ services:
     volumes:
       - ./compose/mysql/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
       - ./compose/mysql/init-infdb.sh:/docker-entrypoint-initdb.d/20-init-infdb.sh:ro
+      # 上の command が参照するサーバ証明書 / CA バンドル (pki-init が発行)
+      - pki:/mnt/pki:ro
       - mysql-data:/var/lib/mysql
     ports:
       - "3306:3306"
+    depends_on:
+      # サーバ証明書が volume に置かれる前に mysqld が起動すると、
+      # ssl_cert が読めず TLS 無しで上がってしまう (require_secure_transport=ON の
+      # ため実際には起動自体が失敗する)。発行完了を待ってから起動する。
+      pki-init:
+        condition: service_healthy
     healthcheck:
       # mysqladmin ping は「サーバが応答したこと」しか見ておらず、認証エラー
       # (ER_ACCESS_DENIED) でも成功を返すため、アプリが実際に使えるかは分からない。
       # front/back が使う appuser / appdb で SELECT できることまで検証する。
-      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" -D\"$$MYSQL_DATABASE\" -e 'SELECT 1' >/dev/null 2>&1"]
+      # --ssl-mode=REQUIRED を付けることで「TLS が張れること」も healthy の条件にする
+      # (RDS Proxy は TLS 必須なので、ここで落ちる構成は本番でも動かない)。
+      test: ["CMD-SHELL", "mysql --ssl-mode=REQUIRED -h 127.0.0.1 -u\"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" -D\"$$MYSQL_DATABASE\" -e 'SELECT 1' >/dev/null 2>&1"]
       interval: 5s
       timeout: 5s
       # 猶予は start_period 20s + 5s x 60 = 約 320 秒。
@@ -345,20 +398,59 @@ services:
   cwagent:
     image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
     container_name: cwagent
+    # --- 起動前の自己診断 (compose/cwagent/verify-mount.sh) --------------------
+    # CloudWatch Agent のイメージは診断ツールが乏しく `docker compose exec` での
+    # 目視確認が現実的でないため、エージェント本体を exec する直前に
+    # 「同じコンテナ・同じマウント名前空間」で検証を実行し、結果を stdout
+    # (= docker compose logs cwagent / ビルドログ) へ出力する。
+    #   - /mnt/logs が本当にマウントされているか (/proc/self/mountinfo で判定)
+    #   - 偽装 EFS の 6301:6302 / 2775 に対して自分の uid/gid で読めるか
+    #   - 設定の file_path (glob) のディレクトリ構造が実在し open(2) できるか
+    # 検証は診断であって門番ではないので、FAIL でも起動は止めない。
+    # 注意: entrypoint を上書きするとイメージの CMD が消えるため command で明示する。
+    entrypoint: ["/bin/sh", "/opt/cwagent-verify/verify-mount.sh"]
+    command: ["/opt/aws/amazon-cloudwatch-agent/bin/start-amazon-cloudwatch-agent"]
     environment:
       AWS_REGION: ap-northeast-1
+      # 自己診断の対象と期待値 (efs-mock の初期化値に合わせる)
+      CWA_VERIFY_MOUNTS: /mnt/logs
+      CWA_VERIFY_CONFIG_DIR: /etc/cwagentconfig
+      CWA_VERIFY_EXPECT_OWNER: "6301:6302"
+      CWA_VERIFY_EXPECT_MODE: "775"
+      # 起動直後はアプリがまだログを書いていないので、書き込み開始後に再評価する
+      CWA_VERIFY_RECHECK_COUNT: "5"
+      CWA_VERIFY_RECHECK_INTERVAL: "20"
+      CWA_VERIFY_RELAY_AGENT_LOG: "1"
     volumes:
       # ECS では SSM Parameter Store (CW_CONFIG_CONTENT) で注入する設定を、
       # ローカルでは /etc/cwagentconfig へのファイルマウントで注入する
       - ./compose/cwagent/cwagent-config.json:/etc/cwagentconfig/cwagent-config.json:ro
       - ./compose/cwagent/aws-credentials:/root/.aws/credentials:ro
+      - ./compose/cwagent/verify-mount.sh:/opt/cwagent-verify/verify-mount.sh:ro
       - efs-logs:/mnt/logs:ro   # 読み取り専用で十分 (tail するだけ)
+    # 偽装 EFS のマウントポイントは 6301:6302 / mode 2775 で、other には r-x しか無い。
+    # このイメージは uid=0 で動くため DAC はバイパスされ、実際には group_add 無しでも
+    # 読めてしまう。ただしそれは「root 実行に依存して読めている」だけで、
+    # front/back 側の umask 変更やイメージの非 root 化で簡単に壊れる。
+    # front/back と同じく GID 6302 を明示して、EFS の POSIX 権限だけで
+    # 読めている状態 (= 実 EFS でアクセスポイント不使用時と同じ前提) を保証する。
+    group_add:
+      - "6302"
     depends_on:
       efs-mock:
         condition: service_healthy
       # 送信先 WireMock の listen 完了まで待つ (未 listen だと初回送信が捨てられる)
       cloudwatch-logs-mock:
         condition: service_healthy
+    healthcheck:
+      # 起動時の自己診断が FAIL でなければ healthy。
+      # (再評価の結果は /tmp/cwagent-verify.latest.result に入るが、アプリの
+      #  ログ書き込みタイミングに依存するため healthcheck には使わない)
+      test: ["CMD-SHELL", "test -s /tmp/cwagent-verify.boot.result && ! grep -q FAIL /tmp/cwagent-verify.boot.result"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
 
   # CloudWatch Logs API のローカル代替スタブ (cwagent の「送信の偽装」先)
   # CreateLogGroup / CreateLogStream / PutLogEvents を 200 で受けるだけで実送信はしない。
@@ -522,7 +614,7 @@ services:
       - pki:/pki
     healthcheck:
       # 生成完了マーカーと、各コンテナが実際に参照するファイルの存在を確認する
-      test: ["CMD-SHELL", "test -f /pki/.pki-ready && test -f /pki/secure-api/server.p12 && test -f /pki/alb/selfsigned/server.key && test -f /pki/trust/10-local-test-root-ca.crt"]
+      test: ["CMD-SHELL", "test -f /pki/.pki-ready && test -f /pki/secure-api/server.p12 && test -f /pki/alb/selfsigned/server.key && test -f /pki/rds-proxy/server.key && test -f /pki/ca/ca-chain.crt && test -f /pki/trust/10-local-test-root-ca.crt"]
       interval: 3s
       timeout: 3s
       retries: 20

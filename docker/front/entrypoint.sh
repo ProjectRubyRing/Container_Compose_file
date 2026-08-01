@@ -156,6 +156,24 @@ import_trusted_certs() {
 
 import_trusted_certs
 
+# --- DB への TLS 設定と JVM トラストストアの整合性チェック --------------------
+# XA データソースの SslMode は ${env.DB_SSL_MODE} (既定 VERIFY_IDENTITY)。
+# VERIFY_CA / VERIFY_IDENTITY は「サーバ証明書を発行した CA が JVM トラストストア
+# にある」ことが前提で、無い場合はプール初期化時に
+#   PKIX path building failed / unable to find valid certification path
+# という一見 DB と無関係なエラーになり原因の切り分けに時間がかかる。
+# ここで前もって警告を出しておく。
+#   ローカル … pki-init のルート/中間 CA (上の import_trusted_certs で取り込み済み)
+#   本番     … Amazon RDS の CA バンドル (global-bundle.pem) を ${PKI_TRUST_DIR} へ
+#              配置するか、イメージへ焼き込んでおく
+DB_SSL_MODE="${DB_SSL_MODE:-VERIFY_IDENTITY}"
+if [[ "${DB_SSL_MODE}" == VERIFY_* && "${JAVA_TOOL_OPTIONS}" != *"-Djavax.net.ssl.trustStore="* ]]; then
+  log "WARN: DB_SSL_MODE=${DB_SSL_MODE} だがトラストストアを構成できていません"
+  log "WARN: DB のサーバ証明書を発行した CA が JDK 同梱 cacerts に無いと XA 接続に失敗します"
+  log "WARN: ${PKI_TRUST_DIR} に CA 証明書を置くか、DB_SSL_MODE=REQUIRED を指定してください"
+fi
+log "DB connection: host=${DB_HOST} port=${DB_PORT} db=${DB_NAME} sslMode=${DB_SSL_MODE}"
+
 log "JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}"
 
 # --- ヒープ等の追加 JVM オプション (JBoss 標準の JAVA_OPTS_APPEND を利用) -----

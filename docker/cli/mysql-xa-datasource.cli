@@ -47,8 +47,18 @@ embed-server --server-config=standalone.xml --std-out=echo
 /subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=DatabaseName:add(value=${env.DB_NAME})
 # MySQL の XA 制約 (同一 XID の XA START〜XA PREPARE は同一物理コネクション必須) への対策
 /subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=PinGlobalTxToPhysicalConnection:add(value=true)
-# TLS 接続 (Aurora / RDS Proxy 接続時は要件に応じて VERIFY_IDENTITY 等へ変更)
-/subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=SslMode:add(value=${env.DB_SSL_MODE:PREFERRED})
+# TLS 接続。既定を VERIFY_IDENTITY にしている理由:
+#   接続先は RDS Proxy (本番) / mysql コンテナ (ローカル) のどちらも
+#   「CA 発行のサーバ証明書を提示し、TLS を必須とするエンドポイント」であり、
+#   証明書チェーンと接続先ホスト名まで検証できる。PREFERRED だと中間者に
+#   平文へダウングレードされても気付けないため、既定を厳しい側に置く。
+#
+# 前提: 接続先サーバの証明書を発行した CA が JVM トラストストアに入っていること。
+#   ローカル  … pki-init が発行したルート/中間 CA を entrypoint.sh が取り込む
+#   本番      … Amazon RDS の CA バンドル (global-bundle.pem) を取り込む
+#              (取り込まれていないと VERIFY_* は必ず失敗する。docs/RDS-PROXY-TLS.md 参照)
+# 検証を緩める必要がある場合のみ DB_SSL_MODE=REQUIRED / PREFERRED で上書きする。
+/subsystem=datasources/xa-data-source=AppXADS/xa-datasource-properties=SslMode:add(value=${env.DB_SSL_MODE:VERIFY_IDENTITY})
 
 # --- トランザクションマネージャ: XA リカバリ用ノード ID ----------------------
 # 同一 DB を共有する全 EAP インスタンスで一意にすること (起動時に -Djboss.tx.node.id で注入)

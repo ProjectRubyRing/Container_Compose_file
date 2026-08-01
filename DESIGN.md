@@ -33,7 +33,7 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 | app-front / app-back | 同じ | 同一 Dockerfile・同一 entrypoint・同一イメージ |
 | adot-collector (awsxray) | adot-collector (debug + otlphttp/jaeger) | 同一イメージ・receiver/processor 同一、exporter のみ差し替え |
 | X-Ray コンソール | Jaeger UI (:16686) | トレース可視化の代替 |
-| Aurora MySQL 8.4 + RDS Proxy | mysql:8.4.7 | XA_RECOVER_ADMIN を init.sql で付与。Connector/J 9.7.0 (静的モジュール)。詳細は [docs/MYSQL-8.4-AURORA-UPGRADE.md](docs/MYSQL-8.4-AURORA-UPGRADE.md) |
+| Aurora MySQL 8.4 + RDS Proxy | mysql:8.4.7 | XA_RECOVER_ADMIN を init.sql で付与。Connector/J 9.7.0 (静的モジュール)。TLS は pki-init 発行の CA 発行証明書 + 平文拒否で RDS Proxy 相当にそろえ、本番と同じ `sslMode=VERIFY_IDENTITY` で検証する。詳細は [docs/MYSQL-8.4-AURORA-UPGRADE.md](docs/MYSQL-8.4-AURORA-UPGRADE.md) / [docs/RDS-PROXY-TLS.md](docs/RDS-PROXY-TLS.md) |
 | ElastiCache for Valkey | valkey:8.0 | — |
 | SVF 帳票サーバ (ALB) | WireMock (svf-mock) | REST スタブ |
 | EFS (/mnt/logs, /mnt/data。アクセスポイント不使用) | efs-mock + named volume | UID 6301 / GID 6302, mode 2775 (setgid) で初期化。front/back は `group_add: 6302` で書き込み。ホスト側の権限変更は不要 |
@@ -111,6 +111,11 @@ MySQL 固有の考慮:
   同一物理コネクションで行う必要があるため必須
 - `XA_RECOVER_ADMIN` 権限 — EAP のリカバリマネージャが `XA RECOVER` を発行する。
   Aurora 側でも DBA 作業として `GRANT XA_RECOVER_ADMIN ON *.* TO ...` が必要 (init.sql と同等)
+- `SslMode` — 既定 `VERIFY_IDENTITY` (`${env.DB_SSL_MODE}` で上書き可)。接続先は本番・ローカルとも
+  「CA 発行のサーバ証明書を提示し TLS を必須とするエンドポイント」(RDS Proxy / TLS 設定済み mysql
+  コンテナ) のため、チェーンとホスト名まで検証する。**サーバ証明書を発行した CA を JVM トラストストアへ
+  取り込むことが前提** (ローカルは pki-init、本番は Amazon RDS の CA バンドル)。
+  詳細は [docs/RDS-PROXY-TLS.md](docs/RDS-PROXY-TLS.md)
 - `node-identifier` — `${jboss.tx.node.id:changeme}` とし、起動時に `-Djboss.tx.node.id` で注入。
   同一 DB を共有する全 EAP インスタンスで一意でないと、他ノードの in-doubt トランザクションを
   誤ってロールバックする事故につながる。タスク定義では `<APP_NAME>-<ENV>-front` / `-back` を設定
@@ -190,10 +195,40 @@ aws ecs update-service --cluster <ECS_CLUSTER_NAME> --service <ECS_SERVICE_NAME>
 
 | 症状 | 原因と対処 |
 |---|---|
+| `XAER_INVAL: Invalid arguments (or unsupported command)` | **トランザクションの中断 (suspend) が原因**。MySQL は `XA END ... SUSPEND` / `XA START ... RESUME` を実装しておらず、XA トランザクション中に Narayana が `XAResource.end(xid, TMSUSPEND)` を発行すると必ずこのエラーになる。XA コネクションを enlist したまま `@TransactionAttribute(REQUIRES_NEW / NOT_SUPPORTED / NEVER)` のメソッドを呼ぶ、`TransactionManager.suspend()` を呼ぶ、といった箇所を洗い出し、**DB アクセスを中断の前に完了させる**か、`REQUIRES_NEW` の呼び出しを同一トランザクション外へ出す。MySQL 側の設定では回避できない (下の検証結果を参照) |
 | `XAER_RMERR` が XA RECOVER で発生 | DB ユーザーに `XA_RECOVER_ADMIN` が無い。GRANT する |
 | `XAER_NOTA` / prepare 失敗 | `PinGlobalTxToPhysicalConnection=true` が入っているか確認 (RDS Proxy の多重化と相性が悪いため必須) |
 | 他ノードのトランザクションが勝手にロールバックされる | `node-identifier` が重複。`TX_NODE_ID` をインスタンスごとに一意化する。ECS でサービスを複数タスクにスケールする場合は、固定値ではなくタスク ID 由来の値 (entrypoint のデフォルト `front-$(hostname)` はコンテナ ID 由来なので一意) を使うこと。ただしタスク入れ替えで ID が変わると in-doubt トランザクションのリカバリが引き継がれない点はトレードオフ |
 | RDS Proxy 経由で XA が失敗する | RDS Proxy はセッションピン留めが発生する。`PinGlobalTxToPhysicalConnection` と併せて、Proxy のピン留めメトリクス (`DatabaseConnectionsCurrentlySessionPinned`) を監視 |
+
+#### MySQL 8.4.7 + Connector/J 9.7.0 での XA 操作の実測結果
+
+どの操作がどのエラーになるかを実機で確認した結果 (切り分けの基準にする):
+
+| XAResource の呼び出し | 発行される SQL | 結果 |
+|---|---|---|
+| `end(xid, TMSUSPEND)` | `XA END ... SUSPEND` | **XAER_INVAL** ← 中断は非対応 |
+| `start(xid, TMRESUME)` (中断後の再開) | `XA START ... RESUME` | **XAER_INVAL** |
+| `start(xid, TMJOIN)` | `XA START ... RESUME` (Connector/J が読み替え) | 分岐が IDLE なら成功 |
+| `start`/`end`/`prepare`/`commit` (中断なしの通常 2PC) | — | 成功 |
+| 同一 gtrid・別 bqual を別コネクションで 2 ブランチ | — | 成功 (2PC 本来の形) |
+| 同一コネクションで 2 ブランチ目を `start` | — | XAER_RMFAIL (ACTIVE state) |
+| gtrid または bqual が **65 byte 以上** | — | XAER_RMFAIL (XAER_INVAL ではない) |
+
+つまり **XAER_INVAL が出たら、まず「トランザクションの中断」を疑う**。
+XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_RMFAIL になるため区別できる。
+なお gtrid・bqual の上限は各 64 byte なので、`TX_NODE_ID` は短く保つこと
+(ECS の `<APP_NAME>-<ENV>-front` が長くなりすぎないよう注意)。
+
+### DB の TLS 関連
+
+| 症状 | 原因と対処 |
+|---|---|
+| mysql のログに `MY-010068 CA certificate ca.pem is self signed.` / `MY-013602 Channel mysql_main configured to support TLS.` | **どちらもエラーではない** (mysqld 起動時の Warning と通知)。前者は自己署名証明書の自動生成が止まっていないサイン。`docker compose down -v` で作り直す。詳細は [docs/RDS-PROXY-TLS.md](docs/RDS-PROXY-TLS.md) |
+| `PKIX path building failed` でプール初期化に失敗 | `SslMode=VERIFY_*` なのにサーバ証明書の CA が JVM トラストストアに無い。ローカルは pki-init の CA、本番は Amazon RDS の CA バンドル (`global-bundle.pem`) を `PKI_TRUST_DIR` へ配置する。entrypoint が起動時に警告を出す |
+| `No subject alternative names matching ...` | 証明書の SAN に `DB_HOST` の値が含まれていない。ローカルは `PKI_RDS_PROXY_SAN` を直して再発行、本番は RDS Proxy のエンドポイント FQDN を `DB_HOST` に指定する |
+| `ERROR 3159 Connections using insecure transport are prohibited` | `require_secure_transport=ON` / RDS Proxy の "Require TLS" が有効。クライアント側で TLS を有効にする (想定どおりの挙動) |
+| `Public Key Retrieval is not allowed` | 平文接続で `caching_sha2_password` を使ったとき。TLS が張れていないので上記を先に解決する |
 
 ### SSM / タスク起動関連
 
@@ -212,3 +247,13 @@ aws ecs update-service --cluster <ECS_CLUSTER_NAME> --service <ECS_SERVICE_NAME>
   アプリ→Collector 間の問題。
 - ポート衝突 (3306/6379/8080 等) → ホスト側で既存のプロセスが使用していないか確認し、
   compose.yaml の `ports` の左側 (ホスト側) だけ変更する。
+- cwagent から PutLogEvents が飛ばない → `./verify-local.sh` の 13/14 を見る。
+  cwagent は entrypoint ラッパー (`compose/cwagent/verify-mount.sh`) が起動時と
+  起動後に自己診断を出すので、`docker compose logs cwagent | grep cwagent-verify` で
+  「マウント成立 / 設定 file_path の glob 一致件数 / open(2) 可否 / tail state の有無」を
+  確認する。CloudWatch Agent のイメージはシェル操作での確認が難しいため、
+  `docker compose exec` ではなくこのログを一次情報にする。
+  - `マウントポイントではない` → compose.yaml の `cwagent.volumes` を確認
+  - `glob に一致するファイルが 0 件` → アプリの出力パスと `cwagent-config.json` の
+    `file_path` の食い違い
+  - `読み取り不可 (open 失敗)` → 偽装 EFS の 6301:6302 権限と `group_add` を確認

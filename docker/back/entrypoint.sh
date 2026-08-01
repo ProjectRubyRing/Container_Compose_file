@@ -135,6 +135,17 @@ import_trusted_certs() {
 
 import_trusted_certs
 
+# --- DB への TLS 設定と JVM トラストストアの整合性チェック (front と同一) ------
+# VERIFY_CA / VERIFY_IDENTITY は「サーバ証明書を発行した CA が JVM トラストストア
+# にある」ことが前提。無い場合は PKIX path building failed で XA 接続が失敗する。
+DB_SSL_MODE="${DB_SSL_MODE:-VERIFY_IDENTITY}"
+if [[ "${DB_SSL_MODE}" == VERIFY_* && "${JAVA_TOOL_OPTIONS}" != *"-Djavax.net.ssl.trustStore="* ]]; then
+  log "WARN: DB_SSL_MODE=${DB_SSL_MODE} だがトラストストアを構成できていません"
+  log "WARN: DB のサーバ証明書を発行した CA が JDK 同梱 cacerts に無いと XA 接続に失敗します"
+  log "WARN: ${PKI_TRUST_DIR} に CA 証明書を置くか、DB_SSL_MODE=REQUIRED を指定してください"
+fi
+log "DB connection: host=${DB_HOST} port=${DB_PORT} db=${DB_NAME} sslMode=${DB_SSL_MODE}"
+
 log "JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}"
 
 export JAVA_OPTS_APPEND="${JAVA_OPTS_APPEND:-}"

@@ -199,14 +199,18 @@ Connector/J 9.7.0 経由で Aurora 8.4 / MySQL 8.4.7 に XA 接続できる（�
 
 ### 2.4 TLS / 認証まわり（8.4 サーバへの接続で押さえる点）
 
-XA データソースは `SslMode=${env.DB_SSL_MODE:PREFERRED}` で接続する（`mysql-xa-datasource.cli`）。
+XA データソースは `SslMode=${env.DB_SSL_MODE:VERIFY_IDENTITY}` で接続する（`mysql-xa-datasource.cli`）。
+ローカルの `mysql` コンテナも **RDS Proxy と同じく「CA 発行のサーバ証明書を提示し、
+平文接続を拒否する」設定**にそろえてあるため、本番と同じ検証レベルで動作確認できる。
+設定の詳細・`MY-010068` / `MY-013602` の読み方は **[docs/RDS-PROXY-TLS.md](RDS-PROXY-TLS.md)** を参照。
 
 | 項目 | 説明 |
 |---|---|
-| `caching_sha2_password` | 8.4 の既定。**TLS 接続なら公開鍵交換が不要**で透過的に成功。本構成は PREFERRED で TLS が張られるため OK |
-| 平文接続にしたい場合 | `allowPublicKeyRetrieval=true` が別途必要になる。ローカルで TLS を切るときの注意点（通常は不要） |
+| `caching_sha2_password` | 8.4 の既定。**TLS 接続なら公開鍵交換が不要**で透過的に成功。本構成は常に TLS が張られるため OK |
+| 平文接続にしたい場合 | `allowPublicKeyRetrieval=true` が別途必要。ただし現在は `require_secure_transport=ON` のため平文接続自体が拒否される（RDS Proxy の "Require TLS" 相当） |
 | `mysql_native_password` | 8.4 では既定 OFF。**このプラグインに依存した接続文字列/ユーザは使わない**こと |
-| Aurora + RDS Proxy | 本番は要件に応じ `SslMode=VERIFY_IDENTITY`（サーバ証明書＋ホスト名検証）へ。`DB_SSL_MODE` 環境変数で切替可能 |
+| Aurora + RDS Proxy | 本番も `DB_SSL_MODE=VERIFY_IDENTITY`（`ecs/taskdef.json` に明示）。**Amazon RDS の CA バンドルを JVM トラストストアへ入れる**のが前提 |
+| サーバ証明書の自動生成 | コミュニティ版の既定（自己署名 `ca.pem` の自動生成）は `auto_generate_certs=OFF` で無効化し、pki-init 発行の CA 発行証明書を使う |
 | Connector/J 9.x の TLS | 旧 `useSSL` / `verifyServerCertificate` は非推奨。`sslMode`（本構成が使用）に統一されている |
 
 ### 2.5 XA / 2PC は 8.0 と同じ考慮がそのまま必要
@@ -271,4 +275,8 @@ docker compose logs app-back | grep -i -E "datasource|AppXADS|WFLYJCA"
   `<resource-root path>` と Dockerfile の `MYSQL_CONNECTOR_VERSION`（jar 名）が一致しているか。
 - **mysql が起動しない/ループ再起動** → 8.0 時代の `mysql-data` volume が残存（1.2 の作り直し）。
 - **認証エラー（`Public Key Retrieval is not allowed` 等）** → 平文接続時のみ発生。
-  `SslMode=PREFERRED`（既定）で TLS を張れば解消（2.4 参照）。
+  TLS が張れていない証拠なので、証明書/トラストストア側を先に確認する（2.4 と
+  [docs/RDS-PROXY-TLS.md](RDS-PROXY-TLS.md) 7 章）。
+- **`MY-010068 CA certificate ca.pem is self signed` / `MY-013602 Channel mysql_main ...`**
+  → **エラーではない**（mysqld 起動時の Warning と通知）。前者が出る場合は
+  自己署名証明書の自動生成が止まっていないので、[docs/RDS-PROXY-TLS.md](RDS-PROXY-TLS.md) を参照。

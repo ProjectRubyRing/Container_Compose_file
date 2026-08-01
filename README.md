@@ -9,6 +9,7 @@ compose.yaml                         # ローカル検証用 compose (Jaeger を
 DESIGN.md                            # 設計判断の根拠・デプロイ手順・トラブルシューティング
 docs/ASYNC-SQS-LAMBDA-ALB.md         # 非同期チェーン (SQS→Lambda→ALB→app-back) 詳細ガイド
 docs/MYSQL-8.4-AURORA-UPGRADE.md     # Aurora 8.4 / MySQL 8.4.7 化・Connector/J 9.7.0 の詳細解説
+docs/RDS-PROXY-TLS.md                # DB の TLS を RDS Proxy 相当にそろえる設定 / MY-010068 の読み方
 docs/TLS-SELF-SIGNED-ALB.md          # 自己署名証明書 HTTPS / JVM トラストストア / ALB 証明書の詳細ガイド
 .env.example                         # compose 用環境変数の雛形 (→ .env にコピー)
 verify-local.sh                      # ローカル動作確認スクリプト
@@ -23,6 +24,7 @@ compose/
   svf-mock/mappings/report.json      # SVF 帳票サーバの WireMock スタブ
   ecs-metadata-mock/mappings/        # ECS Task Metadata Endpoint v4 の WireMock スタブ
   cwagent/cwagent-config.json        # CloudWatch Agent ローカル設定 (endpoint_override → mock)
+  cwagent/verify-mount.sh            # cwagent の自己診断ラッパー (マウント/権限/設定パスを検証しログ出力)
   cloudwatch-logs-mock/mappings/     # CloudWatch Logs API の WireMock スタブ (送信の偽装先)
   sqs/elasticmq.conf                 # SQS のローカル代替 (ElasticMQ) キュー/DLQ 設定
   lambda/app/handler.py              # Lambda 関数 (SQS→ALB→app-back を POST 呼び出し)
@@ -31,7 +33,7 @@ compose/
   alb/rules/                         # ALB リスナールール (★差し替え可能★, variants/ に切り替えソース)
   alb/rules-tls/                     # HTTPS リスナーのルール (★差し替え可能★)
   alb/tls/                           # HTTPS リスナーに適用する証明書 (★差し替え可能★, variants/ あり)
-  pki/gen-certs.sh, Dockerfile       # 自己署名 PKI 発行 (ルートCA→中間CA→サーバ証明書)
+  pki/gen-certs.sh, Dockerfile       # 自己署名 PKI 発行 (ルートCA→中間CA→サーバ証明書 / secure-api・ALB・MySQL)
   secure-api/mappings/               # HTTPS 専用 REST API (WireMock) のスタブ
   tls-verifier/verify-tls.sh, Dockerfile # TLS 経路の検証コンテナ (compose ネットワーク内から実行)
   maintenance-lambda/app/maintenance.py  # メンテナンス画面 Lambda (★差し替え可能★, 画面HTML+503)
@@ -149,6 +151,36 @@ curl -s  http://localhost:8080/tls-probe/truststore           | jq .   # 取り�
 - `cwagent` (ECS taskdef と同じ CloudWatch Agent イメージ) が `/mnt/logs` の
   `app-front*.log` / `app-back*.log` を検知・tail し、`logs.endpoint_override` により
   実 AWS ではなく `cloudwatch-logs-mock` (WireMock, http://localhost:8480) へ PutLogEvents を送信する。
+- `cwagent` も front/back と同じく `group_add: 6302` を指定する。イメージが uid=0 で動くため
+  DAC はバイパスされ実際には無くても読めてしまうが、それは **root 実行に依存して読めている**
+  だけで、アプリ側 umask の変更やイメージの非 root 化で壊れる。EFS の POSIX 権限だけで
+  読めている状態 (= アクセスポイント不使用の実 EFS と同じ前提) を保証するために明示する。
+
+### cwagent の自己診断 (マウント/権限/設定パス)
+
+CloudWatch Agent のイメージは診断ツールが乏しく `docker compose exec cwagent` での目視確認が
+現実的でないため、**エージェント本体を exec する直前に同じコンテナ内で検証を実行し、
+結果を stdout (= `docker compose logs` / ビルドログ) へ出力する**ラッパーを挟んでいる
+(`compose/cwagent/verify-mount.sh` を `entrypoint` で指定)。
+
+検証内容:
+
+| 観点 | 判定方法 |
+| --- | --- |
+| volumes 指定が実際にマウントとして成立しているか | `/proc/self/mountinfo` に `/mnt/logs` が mount point として現れるか |
+| 6301:6302 / mode 2775 を満たしているか | `stat` の owner/mode を期待値と比較。other ビットから「GID 6302 無しでも読めるか」も評価 |
+| 設定の `file_path` のディレクトリ構造が実在するか | 親ディレクトリの存在と `readdir` 可否 |
+| 対象ファイルを実際に読めるか | glob 展開して **`open(2)` を実行**して実測 (`[ -r ]` は uid=0 だと常に真になるため使わない) |
+| エージェントがファイルを検知したか | tail オフセットの state ファイル (`.../logs/state`) の有無 |
+| 送信の前提条件 | エンドポイントの名前解決・TCP 接続・認証情報ファイルの読み取り可否 |
+
+起動直後 (`[boot]`) と、アプリがログを書き始めた後 (`[recheck N]`, 既定 20 秒間隔 × 5 回) に
+評価する。`[boot]` の結果は healthcheck にも使われる (FAIL なら unhealthy)。
+
+```bash
+docker compose logs cwagent | grep cwagent-verify
+```
+
 - 送信の確認 (件数):
 
 ```bash
