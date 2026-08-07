@@ -1,33 +1,42 @@
 #!/bin/sh
 # =============================================================================
-# 自己署名 PKI 一式の発行 (テスト環境専用)
+# 自己証明書 (自己署名 CA) 一式の発行 (テスト環境専用)
 # ---------------------------------------------------------------------------
-# 実 AWS との対応:
-#   ルート CA / 中間 CA        → AWS Private CA (ACM PCA) もしくは社内 CA
-#                                 (DB 経路については Amazon RDS Root CA → リージョン中間 CA)
-#   secure-api のサーバ証明書   → 中間 CA が発行したサーバ証明書 (CA 発行パターン)
-#   alb/ca-issued のサーバ証明書 → ACM が発行 / ACM にインポートした CA 発行証明書
-#   alb/selfsigned のサーバ証明書 → 自己署名証明書をそのまま ALB に適用するパターン
-#   rds-proxy のサーバ証明書     → RDS Proxy エンドポイントが提示する証明書
-#                                 (実 AWS では rds-ca-rsa2048-g1 等、Amazon RDS CA 発行)
+# 【この構成の考え方】
+#   信頼の起点を「自己署名 CA 証明書 1 枚 = cacert.crt」に一本化する。
+#   front/back は cacert.crt を JDK と JBoss の 2 つのトラストストアへ取り込み、
+#   その 1 枚だけで secure-api / ALB / MySQL のサーバ証明書を検証する。
+#   実運用で「社内 CA の自己署名ルート証明書 (cacert.crt) を配布し、
+#   keytool で JDK 同梱 cacerts と JBoss のトラストストアへインポートする」
+#   運用と同じ形をローカルで再現するのが目的。
 #
-# 「JVM トラストストアに何をインポートするか」の 2 パターンを同時に検証できるよう、
+# 実 AWS との対応:
+#   cacert.crt                   → AWS Private CA (ACM PCA) のルート CA もしくは社内 CA
+#                                   (DB 経路については Amazon RDS Root CA に相当)
+#   secure-api のサーバ証明書     → 上記 CA が発行したサーバ証明書
+#   alb/ca-issued のサーバ証明書   → ACM が発行 / ACM にインポートした CA 発行証明書
+#   alb/selfsigned のサーバ証明書  → 自己署名リーフをそのまま ALB に適用するパターン
+#   rds-proxy のサーバ証明書       → RDS Proxy エンドポイントが提示する証明書
+#                                   (実 AWS では rds-ca-rsa2048-g1 等、Amazon RDS CA 発行)
+#
+# 「JVM トラストストアに何をインポートするか」の 2 パターンを検証できるよう、
 # 意図的に 2 種類の信頼形態を用意している:
-#   (A) 中間 CA 証明書をインポート  → その CA が発行した全証明書を信頼 (secure-api, alb/ca-issued)
-#   (B) 自己署名証明書そのものをインポート → その 1 枚だけを信頼 (alb/selfsigned)
+#   (A) 自己署名 CA 証明書 (cacert.crt) をインポート
+#         → その CA が発行した全証明書を信頼 (secure-api / alb/ca-issued / rds-proxy)
+#   (B) 自己署名リーフ証明書そのものをインポート
+#         → その 1 枚だけを信頼 (alb/selfsigned)
 #
 # 出力レイアウト (${PKI_ROOT}, 既定 /pki):
-#   ca/root-ca.crt|key            ルート CA (自己署名)
-#   ca/intermediate-ca.crt|key    中間 CA (ルート CA が署名)
-#   ca/ca-chain.crt               中間 + ルート (クライアント検証用の CA バンドル)
-#   secure-api/server.crt|key     secure-api のサーバ証明書 (中間 CA 発行)
-#   secure-api/fullchain.crt      サーバ証明書 + 中間 CA (サーバが提示するチェーン)
+#   ca/cacert.crt|key             ★自己署名 CA (唯一のトラストアンカー)
+#   secure-api/server.crt|key     secure-api のサーバ証明書 (cacert 発行)
+#   secure-api/fullchain.crt      サーバ証明書 + cacert (サーバが提示するチェーン)
 #   secure-api/server.p12         WireMock (Jetty) 用 PKCS#12 キーストア
-#   alb/ca-issued/*               ALB 用 (中間 CA 発行) — ACM 発行相当
+#   alb/ca-issued/*               ALB 用 (cacert 発行) — ACM 発行相当
 #   alb/selfsigned/*              ALB 用 (自己署名リーフ) — 自己証明書適用パターン
-#   rds-proxy/server.crt|key      MySQL (RDS Proxy 相当) のサーバ証明書 (中間 CA 発行)
-#   rds-proxy/fullchain.crt       サーバ証明書 + 中間 CA (mysqld が提示するチェーン)
-#   trust/*.crt                   front/back の JVM トラストストアへ入れる証明書
+#   rds-proxy/server.crt|key      MySQL (RDS Proxy 相当) のサーバ証明書 (cacert 発行)
+#   rds-proxy/fullchain.crt       サーバ証明書 + cacert (mysqld が提示するチェーン)
+#   trust/cacert.crt              ★front/back の JDK / JBoss トラストストアへ入れる本命
+#   trust/alb-selfsigned.crt      ALB 自己署名リーフを使うとき用 (パターン B)
 #   .pki-ready                    生成完了マーカー (healthcheck が参照)
 #
 # 注意: テスト環境専用のため秘密鍵はパスフレーズ無し・mode 0644 で配置する
@@ -44,6 +53,8 @@ FORCE="${PKI_FORCE_REGENERATE:-0}"
 
 # 証明書のサブジェクト (テスト用)
 SUBJ_BASE="${PKI_SUBJ_BASE:-/C=JP/ST=Tokyo/L=Chiyoda/O=Local Test Org/OU=Local Test PKI}"
+# 自己証明書 (CA) の CN。front/back のトラストストア一覧でこの名前が見える
+CA_CN="${PKI_CA_CN:-Local Test Self-Signed CA}"
 
 # SAN。compose のサービス名で名前解決するため DNS 名にサービス名を必ず含める
 SECURE_API_SAN="${PKI_SECURE_API_SAN:-DNS:secure-api,DNS:secure-api.local,DNS:localhost,IP:127.0.0.1}"
@@ -56,6 +67,8 @@ RDS_PROXY_SAN="${PKI_RDS_PROXY_SAN:-DNS:mysql,DNS:mysql.local,DNS:localhost,IP:1
 log() { echo "[pki-init] $*" >&2; }
 
 MARKER="${PKI_ROOT}/.pki-ready"
+CACERT="${PKI_ROOT}/ca/cacert.crt"
+CAKEY="${PKI_ROOT}/ca/cacert.key"
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
@@ -74,41 +87,28 @@ else
            "${PKI_ROOT}/rds-proxy" \
            "${PKI_ROOT}/trust"
 
+  # 旧レイアウト (ルート CA + 中間 CA) の残骸が volume に残っていると、
+  # 古い CA で発行された証明書やトラストストア用ファイルを拾ってしまう。
+  # 再生成時は確実に消す (down -v をしなくても切り替わるようにするため)。
+  rm -f "${PKI_ROOT}/ca/root-ca.crt"         "${PKI_ROOT}/ca/root-ca.key" \
+        "${PKI_ROOT}/ca/intermediate-ca.crt" "${PKI_ROOT}/ca/intermediate-ca.key" \
+        "${PKI_ROOT}/ca/ca-chain.crt"        "${PKI_ROOT}/ca"/*.srl
+  rm -f "${PKI_ROOT}/trust"/*.crt
+
   # -------------------------------------------------------------------------
-  # 1) ルート CA (自己署名)
+  # 1) 自己証明書 = 自己署名 CA (cacert.crt)
+  #    これ 1 枚がトラストアンカー。front/back はこれを JDK / JBoss の
+  #    トラストストアへ取り込み、以降の全サーバ証明書をこれで検証する。
+  #    pathlen:0 = この CA は下位 CA を作れない (リーフのみ発行できる)
   # -------------------------------------------------------------------------
-  log "1/7 ルート CA を生成 (自己署名, ${DAYS_CA} 日)"
+  log "1/6 自己証明書 (自己署名 CA) を生成 CN=${CA_CN} (${DAYS_CA} 日)"
   openssl req -x509 -newkey "rsa:${KEY_BITS}" -sha256 -days "${DAYS_CA}" -nodes \
-    -keyout "${PKI_ROOT}/ca/root-ca.key" \
-    -out    "${PKI_ROOT}/ca/root-ca.crt" \
-    -subj   "${SUBJ_BASE}/CN=Local Test Root CA" \
-    -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
+    -keyout "${CAKEY}" \
+    -out    "${CACERT}" \
+    -subj   "${SUBJ_BASE}/CN=${CA_CN}" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -addext "subjectKeyIdentifier=hash" >/dev/null 2>&1
-
-  # -------------------------------------------------------------------------
-  # 2) 中間 CA (ルート CA が署名)
-  # -------------------------------------------------------------------------
-  log "2/7 中間 CA を生成 (ルート CA が署名, ${DAYS_CA} 日)"
-  cat > "${TMP}/intermediate.ext" <<'EOF'
-basicConstraints=critical,CA:TRUE,pathlen:0
-keyUsage=critical,keyCertSign,cRLSign
-subjectKeyIdentifier=hash
-authorityKeyIdentifier=keyid:always,issuer
-EOF
-  openssl req -new -newkey "rsa:${KEY_BITS}" -nodes \
-    -keyout "${PKI_ROOT}/ca/intermediate-ca.key" \
-    -out    "${TMP}/intermediate-ca.csr" \
-    -subj   "${SUBJ_BASE}/CN=Local Test Intermediate CA" >/dev/null 2>&1
-  openssl x509 -req -in "${TMP}/intermediate-ca.csr" \
-    -CA "${PKI_ROOT}/ca/root-ca.crt" -CAkey "${PKI_ROOT}/ca/root-ca.key" -CAcreateserial \
-    -days "${DAYS_CA}" -sha256 -extfile "${TMP}/intermediate.ext" \
-    -out "${PKI_ROOT}/ca/intermediate-ca.crt" >/dev/null 2>&1
-
-  # クライアント (curl / nginx proxy_ssl) が検証に使う CA バンドル。
-  # 順序はリーフに近い方から: 中間 → ルート
-  cat "${PKI_ROOT}/ca/intermediate-ca.crt" "${PKI_ROOT}/ca/root-ca.crt" \
-    > "${PKI_ROOT}/ca/ca-chain.crt"
 
   # サーバ証明書用の共通拡張 (serverAuth)。SAN は呼び出し側で差し替える
   make_server_ext() {  # $1=出力パス  $2=SAN
@@ -122,48 +122,50 @@ authorityKeyIdentifier=keyid,issuer
 EOF
   }
 
-  # 中間 CA でサーバ証明書を発行する
-  issue_from_intermediate() {  # $1=出力ディレクトリ  $2=CN  $3=SAN
+  # 自己証明書 (cacert) でサーバ証明書を発行する
+  issue_from_cacert() {  # $1=出力ディレクトリ  $2=CN  $3=SAN
     _dir="$1"; _cn="$2"; _san="$3"
     make_server_ext "${TMP}/server.ext" "${_san}"
     openssl req -new -newkey "rsa:${KEY_BITS}" -nodes \
       -keyout "${_dir}/server.key" -out "${TMP}/server.csr" \
       -subj "${SUBJ_BASE}/CN=${_cn}" >/dev/null 2>&1
     openssl x509 -req -in "${TMP}/server.csr" \
-      -CA "${PKI_ROOT}/ca/intermediate-ca.crt" -CAkey "${PKI_ROOT}/ca/intermediate-ca.key" \
+      -CA "${CACERT}" -CAkey "${CAKEY}" \
       -CAcreateserial -days "${DAYS_LEAF}" -sha256 -extfile "${TMP}/server.ext" \
       -out "${_dir}/server.crt" >/dev/null 2>&1
-    # サーバが提示するチェーン (リーフ + 中間)。ルートはクライアント側が持つ想定
-    cat "${_dir}/server.crt" "${PKI_ROOT}/ca/intermediate-ca.crt" > "${_dir}/fullchain.crt"
+    # サーバが提示するチェーン。トラストアンカーが 1 枚なのでリーフ + cacert。
+    # (クライアントは cacert を持っている前提なので添付は必須ではないが、
+    #  nginx / mysqld / Jetty で設定を共通化するため常に作る)
+    cat "${_dir}/server.crt" "${CACERT}" > "${_dir}/fullchain.crt"
   }
 
   # -------------------------------------------------------------------------
-  # 3) secure-api のサーバ証明書 (中間 CA 発行)
+  # 2) secure-api のサーバ証明書 (cacert 発行) — ★接続確認の本命の接続先
   # -------------------------------------------------------------------------
-  log "3/7 secure-api のサーバ証明書を発行 (中間 CA 発行, SAN=${SECURE_API_SAN})"
-  issue_from_intermediate "${PKI_ROOT}/secure-api" "secure-api" "${SECURE_API_SAN}"
+  log "2/6 secure-api のサーバ証明書を発行 (cacert 発行, SAN=${SECURE_API_SAN})"
+  issue_from_cacert "${PKI_ROOT}/secure-api" "secure-api" "${SECURE_API_SAN}"
 
   # WireMock (Jetty) は JKS/PKCS#12 キーストアを要求するため PKCS#12 に固める。
-  # -certfile で中間 CA を同梱し、サーバがチェーンを提示できるようにする。
+  # -certfile で cacert を同梱し、サーバがチェーンを提示できるようにする。
   openssl pkcs12 -export \
     -inkey    "${PKI_ROOT}/secure-api/server.key" \
     -in       "${PKI_ROOT}/secure-api/server.crt" \
-    -certfile "${PKI_ROOT}/ca/intermediate-ca.crt" \
+    -certfile "${CACERT}" \
     -name     "secure-api" \
     -out      "${PKI_ROOT}/secure-api/server.p12" \
     -passout  "pass:${KEYSTORE_PASSWORD}" >/dev/null 2>&1
 
   # -------------------------------------------------------------------------
-  # 4) ALB のサーバ証明書 (パターン A: 中間 CA 発行 = ACM 発行相当)
+  # 3) ALB のサーバ証明書 (パターン A: cacert 発行 = ACM 発行相当)
   # -------------------------------------------------------------------------
-  log "4/7 ALB のサーバ証明書 (中間 CA 発行) を発行 SAN=${ALB_SAN}"
-  issue_from_intermediate "${PKI_ROOT}/alb/ca-issued" "alb.example.internal" "${ALB_SAN}"
+  log "3/6 ALB のサーバ証明書 (cacert 発行) を発行 SAN=${ALB_SAN}"
+  issue_from_cacert "${PKI_ROOT}/alb/ca-issued" "alb.example.internal" "${ALB_SAN}"
 
   # -------------------------------------------------------------------------
-  # 5) ALB のサーバ証明書 (パターン B: 自己署名リーフ = 自己証明書をそのまま適用)
+  # 4) ALB のサーバ証明書 (パターン B: 自己署名リーフ = 自己証明書をそのまま適用)
   #    CA を介さないため、信頼させるにはこの証明書自体をトラストストアへ入れる。
   # -------------------------------------------------------------------------
-  log "5/7 ALB のサーバ証明書 (自己署名) を発行 SAN=${ALB_SAN}"
+  log "4/6 ALB のサーバ証明書 (自己署名リーフ) を発行 SAN=${ALB_SAN}"
   openssl req -x509 -newkey "rsa:${KEY_BITS}" -sha256 -days "${DAYS_LEAF}" -nodes \
     -keyout "${PKI_ROOT}/alb/selfsigned/server.key" \
     -out    "${PKI_ROOT}/alb/selfsigned/server.crt" \
@@ -177,7 +179,7 @@ EOF
   cp "${PKI_ROOT}/alb/selfsigned/server.crt" "${PKI_ROOT}/alb/selfsigned/fullchain.crt"
 
   # -------------------------------------------------------------------------
-  # 6) MySQL (RDS Proxy 相当) のサーバ証明書 (中間 CA 発行)
+  # 5) MySQL (RDS Proxy 相当) のサーバ証明書 (cacert 発行)
   #    コミュニティ版 mysqld は既定で初回起動時に「自己署名の ca.pem + サーバ証明書」を
   #    自動生成する。それだと
   #      [Warning] [MY-010068] CA certificate ca.pem is self signed.
@@ -186,18 +188,18 @@ EOF
   #    本番の RDS Proxy は Amazon RDS CA が発行した証明書を提示するので、
   #    ローカルでも CA 発行の証明書を用意して mysqld に使わせ、挙動をそろえる。
   # -------------------------------------------------------------------------
-  log "6/7 MySQL (RDS Proxy 相当) のサーバ証明書を発行 (中間 CA 発行, SAN=${RDS_PROXY_SAN})"
-  issue_from_intermediate "${PKI_ROOT}/rds-proxy" "mysql" "${RDS_PROXY_SAN}"
+  log "5/6 MySQL (RDS Proxy 相当) のサーバ証明書を発行 (cacert 発行, SAN=${RDS_PROXY_SAN})"
+  issue_from_cacert "${PKI_ROOT}/rds-proxy" "mysql" "${RDS_PROXY_SAN}"
 
   # -------------------------------------------------------------------------
-  # 7) front/back の JVM トラストストアへ入れる証明書を trust/ に集約
-  #    ここに置いた *.crt を各コンテナの entrypoint が keytool で取り込む。
-  #    ファイル名 (拡張子除く) がそのまま keytool の alias になる。
+  # 6) front/back のトラストストアへ入れる証明書を trust/ に集約
+  #    ここに置いた *.crt を各コンテナの entrypoint が keytool で
+  #    「JDK 同梱 cacerts のコピー」と「JBoss (Elytron) 用トラストストア」の
+  #    両方へ取り込む。ファイル名 (拡張子除く) がそのまま keytool の alias になる。
   # -------------------------------------------------------------------------
-  log "7/7 トラストストア投入用の証明書を ${PKI_ROOT}/trust へ配置"
-  cp "${PKI_ROOT}/ca/root-ca.crt"              "${PKI_ROOT}/trust/10-local-test-root-ca.crt"
-  cp "${PKI_ROOT}/ca/intermediate-ca.crt"      "${PKI_ROOT}/trust/20-local-test-intermediate-ca.crt"
-  cp "${PKI_ROOT}/alb/selfsigned/server.crt"   "${PKI_ROOT}/trust/30-alb-selfsigned.crt"
+  log "6/6 トラストストア投入用の証明書を ${PKI_ROOT}/trust へ配置"
+  cp "${CACERT}"                               "${PKI_ROOT}/trust/cacert.crt"
+  cp "${PKI_ROOT}/alb/selfsigned/server.crt"   "${PKI_ROOT}/trust/alb-selfsigned.crt"
 
   # 実行ユーザがコンテナごとに異なる (jboss=185 / wiremock=1000 / nginx=root /
   # mysql=999) ため、テスト用途に限り全ファイルを読み取り可能にする
@@ -213,8 +215,7 @@ fi
 
 # --- 生成結果のサマリを出力 (docker logs pki-init で確認できる) ---------------
 log "----------------------------------------------------------------"
-for c in "${PKI_ROOT}/ca/root-ca.crt" \
-         "${PKI_ROOT}/ca/intermediate-ca.crt" \
+for c in "${CACERT}" \
          "${PKI_ROOT}/secure-api/server.crt" \
          "${PKI_ROOT}/alb/ca-issued/server.crt" \
          "${PKI_ROOT}/alb/selfsigned/server.crt" \
@@ -228,10 +229,9 @@ done
 log "----------------------------------------------------------------"
 
 # チェーン検証 (自己検証。ここで失敗するなら生成がおかしい)
-if openssl verify -CAfile "${PKI_ROOT}/ca/root-ca.crt" \
-     -untrusted "${PKI_ROOT}/ca/intermediate-ca.crt" \
-     "${PKI_ROOT}/secure-api/server.crt" >/dev/null 2>&1; then
-  log "chain verify OK: secure-api/server.crt ← intermediate ← root"
+# トラストアンカーは cacert.crt 1 枚なので -untrusted (中間証明書) は不要。
+if openssl verify -CAfile "${CACERT}" "${PKI_ROOT}/secure-api/server.crt" >/dev/null 2>&1; then
+  log "chain verify OK: secure-api/server.crt ← cacert.crt (自己署名 CA)"
 else
   log "ERROR: secure-api のチェーン検証に失敗しました"
   exit 1
@@ -239,11 +239,17 @@ fi
 
 # mysqld も起動時に自分のサーバ証明書を ssl_ca で検証する (失敗すると MY-015010/
 # MY-015011 の警告が出る) ため、ここで同じ検証を先回りして行っておく。
-if openssl verify -CAfile "${PKI_ROOT}/ca/ca-chain.crt" \
-     "${PKI_ROOT}/rds-proxy/server.crt" >/dev/null 2>&1; then
-  log "chain verify OK: rds-proxy/server.crt ← intermediate ← root"
+if openssl verify -CAfile "${CACERT}" "${PKI_ROOT}/rds-proxy/server.crt" >/dev/null 2>&1; then
+  log "chain verify OK: rds-proxy/server.crt ← cacert.crt (自己署名 CA)"
 else
   log "ERROR: rds-proxy (MySQL) のチェーン検証に失敗しました"
+  exit 1
+fi
+
+if openssl verify -CAfile "${CACERT}" "${PKI_ROOT}/alb/ca-issued/server.crt" >/dev/null 2>&1; then
+  log "chain verify OK: alb/ca-issued/server.crt ← cacert.crt (自己署名 CA)"
+else
+  log "ERROR: alb/ca-issued のチェーン検証に失敗しました"
   exit 1
 fi
 

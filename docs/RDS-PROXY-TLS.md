@@ -101,7 +101,7 @@ mysqld は起動時、`ssl_ca` に指定された CA 証明書の issuer と sub
 
 | ファイル | 変更 |
 |---|---|
-| `compose/pki/gen-certs.sh` | **新規**: `rds-proxy/` に MySQL 用サーバ証明書を発行 (中間 CA 発行、`SAN=DNS:mysql,...`) |
+| `compose/pki/gen-certs.sh` | `rds-proxy/` に MySQL 用サーバ証明書を発行 (自己証明書 `cacert.crt` 発行、`SAN=DNS:mysql,...`) |
 | `compose.yaml` (mysql) | mysqld の TLS 設定を `command:` で指定、`pki` volume をマウント、`depends_on: pki-init`、healthcheck を `--ssl-mode=REQUIRED` に |
 | `compose.yaml` (front/back) | `DB_SSL_MODE: VERIFY_IDENTITY` を明示 |
 | `docker/cli/mysql-xa-datasource.cli` | `SslMode` の既定を `PREFERRED` → **`VERIFY_IDENTITY`** |
@@ -111,17 +111,21 @@ mysqld は起動時、`ssl_ca` に指定された CA 証明書の issuer と sub
 
 ### 3.1 証明書 (pki-init)
 
-既存の PKI (ルート CA → 中間 CA) をそのまま使い、DB 用のリーフを 1 枚追加する。
-**実 AWS の「Amazon RDS Root CA → リージョン中間 CA → Proxy エンドポイント証明書」と
-同じ 3 段構成**になる。
+既存の PKI (自己証明書 `cacert.crt` = 自己署名 CA) をそのまま使い、
+DB 用のリーフを 1 枚追加する。
 
 ```
-/pki/ca/root-ca.crt              ← Amazon RDS Root CA 相当
-/pki/ca/intermediate-ca.crt      ← リージョン中間 CA 相当
-/pki/ca/ca-chain.crt             ← global-bundle.pem 相当 (中間 + ルート)
+/pki/ca/cacert.crt               ← Amazon RDS Root CA / global-bundle.pem 相当
+                                    (トラストアンカーはこの 1 枚)
 /pki/rds-proxy/server.crt|key    ← RDS Proxy エンドポイントの証明書相当
-/pki/rds-proxy/fullchain.crt     ← mysqld が提示するチェーン (リーフ + 中間)
+/pki/rds-proxy/fullchain.crt     ← mysqld が提示するチェーン (リーフ + cacert)
 ```
+
+> 実 AWS の Amazon RDS は「Root CA → リージョン中間 CA → エンドポイント証明書」の
+> 3 段だが、ローカルでは**トラストストアへ入れる証明書を 1 枚に固定する**ことを
+> 優先して `cacert.crt` へ一本化している。JVM から見た構造
+> (「トラストストアに入れた CA が発行したリーフを検証する」) は同じであり、
+> 本番で `global-bundle.pem` を取り込む運用にそのまま読み替えられる。
 
 SAN は `DNS:mysql,DNS:mysql.local,DNS:localhost,IP:127.0.0.1`。
 front/back は `DB_HOST=mysql` で接続するため **`DNS:mysql` が必須**
@@ -137,7 +141,7 @@ front/back は `DB_HOST=mysql` で接続するため **`DNS:mysql` が必須**
       - --auto_generate_certs=OFF                      # 自己署名の自動生成をやめる
       - --ssl_cert=/mnt/pki/rds-proxy/fullchain.crt
       - --ssl_key=/mnt/pki/rds-proxy/server.key
-      - --ssl_ca=/mnt/pki/ca/ca-chain.crt
+      - --ssl_ca=/mnt/pki/ca/cacert.crt
       - --require_secure_transport=ON                  # 平文接続を拒否
       - --tls_version=TLSv1.2,TLSv1.3
 ```
@@ -162,9 +166,10 @@ front/back は `DB_HOST=mysql` で接続するため **`DNS:mysql` が必須**
 
 - **`auto_generate_certs=OFF` + `ssl_cert`/`ssl_key` 指定**で datadir の
   `ca.pem` 自動生成・自動検出が止まる。→ **MY-010068 が出なくなる**
-- `ssl_cert` は **fullchain (リーフ + 中間 CA)**。mysqld は
-  `SSL_CTX_use_certificate_chain_file()` で読むため、中間 CA までクライアントへ提示できる。
-  リーフ単体を指定すると、クライアントが中間 CA を持っていない限り検証に失敗する
+- `ssl_cert` は **fullchain (リーフ + cacert)**。mysqld は
+  `SSL_CTX_use_certificate_chain_file()` で読むため、発行元 CA までクライアントへ提示できる。
+  中間 CA を挟む構成では、リーフ単体を指定するとクライアントが中間 CA を
+  持っていない限り検証に失敗する (本番の RDS 構成ではここが効いてくる)
 - **`ssl_ca` は省略してはいけない**。本来はクライアント証明書検証用だが、
   mysqld は起動時に**自分のサーバ証明書もこの CA で検証する**。省略すると
 
@@ -198,6 +203,12 @@ front/back は `DB_HOST=mysql` で接続するため **`DNS:mysql` が必須**
 Connector/J は `trustCertificateKeyStoreUrl` 未指定時に **JVM 既定のトラストストア**
 (`-Djavax.net.ssl.trustStore`) を使うため、entrypoint.sh が
 `${PKI_TRUST_DIR}/*.crt` を取り込んで指定している既存の仕組みにそのまま乗る。
+
+> ここで効くのは **JDK 側**のトラストストア (`/tmp/pki/cacerts`) であり、
+> JBoss (Elytron) 側の `jboss-truststore.p12` ではない。entrypoint.sh は
+> 同じ `cacert.crt` を両方へ取り込むため、DB 経路 (JDK 側) と
+> HTTPS 経路 (JDK / JBoss 両方) のどちらも同じ 1 枚で成立する。
+> 詳細は [docs/TLS-SELF-SIGNED-ALB.md](TLS-SELF-SIGNED-ALB.md) の 3 章を参照。
 
 TLS バージョンの下限はクライアント側では指定せず、**サーバ側 `tls_version` で
 強制**している。RDS Proxy も同様にプロキシ側で下限を決めるため、この方が忠実。
@@ -233,7 +244,7 @@ docker compose exec mysql openssl x509 -in /mnt/pki/rds-proxy/server.crt -noout 
 
 # 5) チェーン + ホスト名検証で接続できること (= 本番と同じ VERIFY_IDENTITY)
 docker compose exec mysql sh -c \
-  'mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/mnt/pki/ca/ca-chain.crt \
+  'mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/mnt/pki/ca/cacert.crt \
      -h mysql -uappuser -p"$MYSQL_PASSWORD" -D appdb -e "SELECT 1"'
 
 # 6) 平文接続が拒否されること (ERROR 3159 になれば OK)
@@ -280,7 +291,8 @@ javax.net.ssl.SSLHandshakeException: PKIX path building failed:
 2. **`PKI_TRUST_DIR` へマウントする** (EFS / サイドカーで配布する場合)
 
 いずれの場合も entrypoint.sh が `${PKI_TRUST_DIR}/*.crt` を keytool で取り込み、
-`-Djavax.net.ssl.trustStore` を JVM へ渡す既存の仕組みがそのまま働く。
+`-Djavax.net.ssl.trustStore` を JVM へ渡す既存の仕組みがそのまま働く
+(同じファイル群は JBoss 側 `jboss-truststore.p12` へも取り込まれる)。
 
 あわせて RDS Proxy 側で:
 
@@ -325,5 +337,5 @@ XA と `caching_sha2_password` の組み合わせで別の考慮が増えるた�
 関連ドキュメント:
 
 - [docs/MYSQL-8.4-AURORA-UPGRADE.md](MYSQL-8.4-AURORA-UPGRADE.md) — MySQL 8.4 / Connector/J 9.7.0 化の差分
-- [docs/TLS-SELF-SIGNED-ALB.md](TLS-SELF-SIGNED-ALB.md) — HTTPS 経路 (secure-api / ALB) の自己署名証明書検証
+- [docs/TLS-SELF-SIGNED-ALB.md](TLS-SELF-SIGNED-ALB.md) — HTTPS 経路 (secure-api / ALB) の自己証明書 (cacert.crt) 検証
 - [DESIGN.md](../DESIGN.md) — XA データソースの設計とトラブルシューティング

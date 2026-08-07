@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 自己署名証明書 HTTPS 経路 (secure-api / ALB HTTPS リスナー) の動作確認
+# 自己証明書 (cacert.crt) HTTPS 経路 (secure-api / ALB HTTPS リスナー) の動作確認
 #   詳細は docs/TLS-SELF-SIGNED-ALB.md を参照
 # ---------------------------------------------------------------------------
 #   ./verify-tls.sh          コンテナ内検証 + ホストからの検証
@@ -9,9 +9,9 @@
 #
 # 検証の主眼:
 #   1. secure-api は HTTPS を要求する (平文 HTTP を受け付けない)
-#   2. 自己署名 CA を信頼しないクライアントは検証に失敗する (対照実験)
-#   3. app-front / app-back は JVM トラストストアに CA / 自己署名証明書を
-#      取り込んでいるため、REST API 呼び出しに成功する
+#   2. 自己証明書 cacert.crt を信頼しないクライアントは検証に失敗する (対照実験)
+#   3. app-front / app-back は cacert.crt を JDK と JBoss(Elytron) の両方の
+#      トラストストアへ取り込んでいるため、どちらの経路でも REST API 呼び出しに成功する
 #   4. ALB (HTTPS リスナー) 経由でも同じ REST API を呼び出せる
 # =============================================================================
 set -uo pipefail
@@ -47,26 +47,26 @@ run_from_host() {
   fi
 
   mkdir -p "${OUT_DIR}"
-  # コンテナ内の named volume から CA バンドルと ALB 自己署名証明書を取り出す
-  if ! docker compose exec -T pki-init cat /pki/ca/ca-chain.crt > "${OUT_DIR}/ca-chain.crt" 2>/dev/null; then
-    echo "WARN: pki-init から CA を取り出せません (docker compose up -d 済みか確認してください)"
+  # コンテナ内の named volume から自己証明書と ALB 自己署名リーフを取り出す
+  if ! docker compose exec -T pki-init cat /pki/ca/cacert.crt > "${OUT_DIR}/cacert.crt" 2>/dev/null; then
+    echo "WARN: pki-init から cacert.crt を取り出せません (docker compose up -d 済みか確認してください)"
     return 1
   fi
   docker compose exec -T pki-init cat /pki/alb/selfsigned/server.crt > "${OUT_DIR}/alb-selfsigned.crt" 2>/dev/null
 
-  echo "CA を ${OUT_DIR}/ へ取り出しました (ブラウザや他ツールでの検証にも使えます)"
+  echo "自己証明書を ${OUT_DIR}/cacert.crt へ取り出しました (ブラウザや他ツールでの検証にも使えます)"
   echo ""
 
-  echo "--- 1. secure-api へ CA 未指定で HTTPS (失敗が期待値) ---"
+  echo "--- 1. secure-api へ cacert.crt 未指定で HTTPS (失敗が期待値) ---"
   if curl -s -S -o /dev/null --max-time 5 "https://localhost:8543/api/v1/ping" 2>&1; then
-    echo "  NG: CA 未指定なのに成功しました"
+    echo "  NG: cacert.crt 未指定なのに成功しました"
   else
-    echo "  OK: 期待どおり検証に失敗しました (自己署名 CA は既定では信頼されない)"
+    echo "  OK: 期待どおり検証に失敗しました (自己証明書は既定では信頼されない)"
   fi
 
-  echo "--- 2. secure-api へ CA 指定で HTTPS REST 呼び出し (成功が期待値) ---"
+  echo "--- 2. secure-api へ cacert.crt 指定で HTTPS REST 呼び出し (成功が期待値) ---"
   curl -s -w "\n  (status: %{http_code})\n" --max-time 10 \
-    --cacert "${OUT_DIR}/ca-chain.crt" \
+    --cacert "${OUT_DIR}/cacert.crt" \
     "https://localhost:8543/api/v1/ping" \
     | sed 's/^/  /' \
     || echo "  NG: 呼び出しに失敗しました"
@@ -89,8 +89,8 @@ run_from_host() {
   fi
 
   echo "--- 5. ALB(HTTPS) 経由で secure-api の REST を呼ぶ (成功が期待値) ---"
-  # 適用中の証明書 (自己署名 / 中間 CA 発行) のどちらでも検証できるよう両方渡す
-  cat "${OUT_DIR}/ca-chain.crt" "${OUT_DIR}/alb-selfsigned.crt" > "${OUT_DIR}/alb-trust.crt" 2>/dev/null
+  # 適用中の証明書 (自己署名リーフ / cacert 発行) のどちらでも検証できるよう両方渡す
+  cat "${OUT_DIR}/cacert.crt" "${OUT_DIR}/alb-selfsigned.crt" > "${OUT_DIR}/alb-trust.crt" 2>/dev/null
   curl -s -w "\n  (status: %{http_code})\n" --max-time 10 \
     --cacert "${OUT_DIR}/alb-trust.crt" --resolve "alb:9443:127.0.0.1" \
     "https://alb:9443/secure/v1/ping" \
@@ -100,12 +100,16 @@ run_from_host() {
   echo "   DNS:alb のため、localhost で叩くとホスト名不一致になります)"
 
   echo "--- 6. app-front / app-back の JVM 経路 (ホスト公開ポート経由) ---"
+  # trust=jdk  … JDK 同梱 cacerts のコピー + cacert.crt (JVM 既定の SSLContext)
+  # trust=jboss… JBoss(Elytron) の jboss-truststore.p12 (cacert.crt のみ)
   for pair in "app-front|http://localhost:8080/tls-probe" "app-back|http://localhost:8180/tls-probe"; do
     name="${pair%%|*}"; base="${pair##*|}"
-    echo "  [${name}] 直接:"
-    curl -s --max-time 20 "${base}/check?target=direct" | sed 's/^/    /' || echo "    NG"
-    echo "  [${name}] ALB 経由:"
-    curl -s --max-time 20 "${base}/check?target=alb" | sed 's/^/    /' || echo "    NG"
+    for trust in jdk jboss; do
+      echo "  [${name}] 直接 (trust=${trust}):"
+      curl -s --max-time 20 "${base}/check?target=direct&trust=${trust}" | sed 's/^/    /' || echo "    NG"
+      echo "  [${name}] ALB 経由 (trust=${trust}):"
+      curl -s --max-time 20 "${base}/check?target=alb&trust=${trust}" | sed 's/^/    /' || echo "    NG"
+    done
   done
 }
 
@@ -140,5 +144,6 @@ echo "  ALB の証明書を切り替える : ./alb-tls-cert.sh selfsigned | ca-i
 echo "  証明書を作り直す         : docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot"
 echo "                             (その後 docker compose restart app-front app-back alb secure-api)"
 echo "  トラストストアの中身     : curl -s http://localhost:8080/tls-probe/truststore"
+echo "                             (JDK 側 / JBoss 側の両方が stores.jdk / stores.jboss に出ます)"
 echo "=============================================================="
 exit "${rc}"

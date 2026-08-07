@@ -99,11 +99,12 @@ curl -i http://localhost:9080/maintenance   # 常時: メンテナンス画面�
 
 **実装・設定方法の詳細は [docs/ASYNC-SQS-LAMBDA-ALB.md](docs/ASYNC-SQS-LAMBDA-ALB.md) を参照。**
 
-## 自己署名証明書による HTTPS 検証 (secure-api / JVM トラストストア / ALB)
+## 自己証明書 (cacert.crt) による HTTPS 検証 (secure-api / JDK・JBoss トラストストア / ALB)
 
-自己署名 CA で発行した証明書でのみ HTTPS を受け付ける REST API サーバを追加し、
-**front/back の JVM トラストストアへ CA (または自己署名証明書そのもの) を取り込むことで、
-アプリコードを無改変のまま REST API を呼び出せる**ことを検証する。ALB 経由も同様に検証できる。
+自己署名 CA (**`cacert.crt`**) で発行した証明書でのみ HTTPS を受け付ける REST API サーバを
+テスト用の接続先として用意し、**呼び出し元の front/back が `cacert.crt` を JDK と JBoss
+(Elytron) の両トラストストアへ取り込むことで、アプリコードを無改変のまま REST API を
+呼び出せる**ことを検証する。ALB 経由も同様に検証できる。
 
 ```bash
 docker compose up -d --build
@@ -111,25 +112,37 @@ docker compose up -d --build
 ./verify-tls.sh quick           # JVM 経路のみ (短時間)
 ```
 
-- `pki-init` が **ルート CA (自己署名) → 中間 CA → 各サーバ証明書** を発行し、named volume で全コンテナへ配る
-- `secure-api` (WireMock, `--disable-http`) が **HTTPS でのみ** REST API を提供 (`:8543`)
-- `app-front` / `app-back` の entrypoint が `keytool` で **JDK 同梱 cacerts のコピーへ CA を追加**し、
-  `-Djavax.net.ssl.trustStore` で JVM に指定する (パブリック CA の信頼は残したまま追加)
+- `pki-init` が **自己証明書 `cacert.crt` (自己署名 CA) → 各サーバ証明書** を発行し、named volume で全コンテナへ配る
+  (トラストアンカーは `cacert.crt` **1 枚に一本化**。ルート CA + 中間 CA の 2 階層は廃止)
+- `secure-api` (WireMock, `--disable-http`) が **HTTPS でのみ** REST API を提供 (`:8543`)。★接続確認用のテスト接続先
+- `app-front` / `app-back` の entrypoint が `keytool` で `cacert.crt` を **2 か所へ取り込む**
+  - **JDK**: 同梱 cacerts のコピーへ追加し `-Djavax.net.ssl.trustStore` で JVM に指定 (パブリック CA の信頼は残る)
+  - **JBoss**: `jboss-truststore.p12` を生成し、Elytron の `key-store` / `trust-manager` /
+    `client-ssl-context` (`docker/cli/elytron-truststore.cli`) が参照する (自己証明書のみの専用ストア)
 - `tls-probe.war` を front/back 両方に配備し、**その JVM 自身から** HTTPS 呼び出しを実行して確認できる
+  (`trust=jdk` / `trust=jboss` / `trust=none` で経路を切り替え)
 - `alb` に **HTTPS リスナー (`:9443`)** を追加。`/secure/*` は secure-api へ HTTPS 再暗号化で転送
 
 ```bash
-# front の JVM から secure-api を直接 / ALB 経由で呼ぶ
-curl -s "http://localhost:8080/tls-probe/check?target=direct" | jq .
-curl -s "http://localhost:8180/tls-probe/check?target=alb"    | jq .
-curl -s  http://localhost:8080/tls-probe/truststore           | jq .   # 取り込み済み証明書
+# front の JVM から secure-api を直接 / ALB 経由で呼ぶ (JDK 側トラストストア)
+curl -s "http://localhost:8080/tls-probe/check?target=direct&trust=jdk"   | jq .
+curl -s "http://localhost:8180/tls-probe/check?target=alb&trust=jdk"      | jq .
 
-# ALB の証明書を切り替える (自己署名 ⇄ 中間 CA 発行)。reload のみで即時反映
+# 同じ呼び出しを JBoss (Elytron) 側トラストストアで
+curl -s "http://localhost:8080/tls-probe/check?target=direct&trust=jboss" | jq .
+
+# 対照実験: 空のトラストストアでは必ず失敗する (502 が正しい)
+curl -s "http://localhost:8080/tls-probe/check?target=direct&trust=none"  | jq .
+
+# JDK 側 / JBoss 側の両トラストストアの中身 (stores.jdk / stores.jboss)
+curl -s  http://localhost:8080/tls-probe/truststore | jq .
+
+# ALB の証明書を切り替える (自己署名リーフ ⇄ cacert.crt 発行)。reload のみで即時反映
 ./alb-tls-cert.sh selfsigned | ca-issued | status
 ```
 
-「自己証明書そのものをインポートする」「中間 CA 証明書をインポートする」の
-**両パターンを同時に検証できる**よう、ALB 用に自己署名リーフと中間 CA 発行の 2 種類を発行している。
+「自己証明書そのものをインポートする」「CA 証明書 (`cacert.crt`) をインポートする」の
+**両パターンを同時に検証できる**よう、ALB 用に自己署名リーフと `cacert.crt` 発行の 2 種類を発行している。
 
 ポート: secure-api `:8543` (HTTPS) / ALB HTTPS リスナー `:9443`
 
@@ -181,12 +194,64 @@ CloudWatch Agent のイメージは診断ツールが乏しく `docker compose e
 docker compose logs cwagent | grep cwagent-verify
 ```
 
+#### `docker compose exec cwagent ls ...` は使えない
+
+CloudWatch Agent のイメージには `ls` / `cat` が入っていない。そのため
+
+```
+OCI runtime exec failed: exec failed: unable to start container process:
+exec: "ls": executable file not found in $PATH
+```
+
+は **「設定ファイルが無い」ではなく「`ls` が無い」** というだけであり、マウントの判定材料に
+してはいけない (このエラーが返る時点で、コンテナ自体は起動している。停止中なら
+`Container ... is not running` になる)。コンテナ内バイナリに依存しない確認手段:
+
+```bash
+# 1) マウントの成立とホスト側パス (docker inspect — コンテナ内バイナリ不要)
+docker inspect cwagent --format '{{range .Mounts}}{{.Type}} {{.Source}} -> {{.Destination}} (rw={{.RW}}){{"\n"}}{{end}}'
+
+# 2) 中身の取り出し (docker cp — コンテナ内バイナリ不要)
+docker cp cwagent:/etc/cwagentconfig/cwagent-config.json ./from-container.json
+
+# 3) シェル組み込みだけで存在確認 (/bin/sh はイメージに存在する = entrypoint が動いている)
+docker compose exec cwagent /bin/sh -c \
+  'echo /etc/cwagentconfig/*; [ -f /etc/cwagentconfig/cwagent-config.json ] && echo EXISTS || echo MISSING'
+```
+
+自己診断ラッパー (`compose/cwagent/verify-mount.sh`) も同じ判定を `[cwagent-verify]` 行として
+出力する。`entry: ...` 行が `/etc/cwagentconfig` の内容、
+`cwagent-config.json がディレクトリになっている` の FAIL はホスト側パスを解決できず
+Docker が空ディレクトリを作った状態 (= マウント失敗) を意味する。
+
 - 送信の確認 (件数):
 
 ```bash
 curl -s -X POST http://localhost:8480/__admin/requests/count \
   -H "Content-Type: application/json" \
   -d '{"method":"POST","url":"/","headers":{"X-Amz-Target":{"equalTo":"Logs_20140328.PutLogEvents"}}}'
+```
+
+#### ログストリームが作られない / イベントが 0 件のとき
+
+`cloudwatch-logs-mock` はスタブなので「ログストリーム」の実体は持たない。判定は WireMock の
+request journal (受信件数) で行う。**どの API も 0 件 = 送信に失敗しているのではなく、
+エージェントが送信自体を試みていない**状態であり、到達性 (名前解決 / TCP / 署名) ではなく
+設定の読み込みとファイル検知を先に疑う。上から順に切り分ける:
+
+| # | 確認 | 0 件の意味 |
+| --- | --- | --- |
+| 1 | `[cwagent-verify]` の `主設定ファイルが存在する` | 設定が注入できていない (未マウント / ディレクトリ化) → 収集対象ゼロ |
+| 2 | `[cwagent-verify]` の `翻訳済み設定あり` | 設定は置かれているが translator が失敗 → `Under path :` / `E!` 行を確認 |
+| 3 | `[cwagent-verify]` の `glob 一致 N 件` | `file_path` に一致するファイルが無い (アプリの出力先とのズレ) |
+| 4 | `[cwagent-verify]` の `tail 状態ファイルあり` | 検知していない。ここまで OK なら送信側 (エンドポイント / 署名) を疑う |
+
+1〜4 は `./verify-local.sh` の 13〜14 が自動で判定・再掲する。手動で見る場合:
+
+```bash
+docker compose logs cwagent | grep cwagent-verify          # 1〜4 の判定
+docker compose logs cwagent | grep -E "Under path :|E!"    # translator / エージェントのエラー
+docker cp cwagent:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json ./translated.json
 ```
 
 ## 置き換えプレースホルダー

@@ -57,7 +57,7 @@ fi
 # 9-2) mysqld が提示する証明書が CA 発行で、SAN に接続先ホスト名 (mysql) を含むこと。
 #      これが成立しないと sslMode=VERIFY_IDENTITY は張れない (= 本番と同じ検証ができない)。
 docker compose exec -T mysql sh -c \
-  'mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/mnt/pki/ca/ca-chain.crt \
+  'mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/mnt/pki/ca/cacert.crt \
      -h mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -D"$MYSQL_DATABASE" -e "SELECT 1" >/dev/null' \
   && echo "VERIFY_IDENTITY (チェーン + ホスト名検証) で接続: OK" \
   || echo "WARN: VERIFY_IDENTITY で接続できません。rds-proxy 証明書の SAN を確認してください"
@@ -122,6 +122,34 @@ else
   echo "WARN: cwagent に /mnt/logs のマウントがありません。compose.yaml の cwagent.volumes を確認してください"
 fi
 
+# --- 設定ファイル (ECS の CW_CONFIG_CONTENT 相当) の注入確認 -------------------
+# 注意: CloudWatch Agent のイメージには ls(1)/cat(1) が無い。
+#   docker compose exec cwagent ls /etc/cwagentconfig
+# は "exec ls: executable file not found in $PATH" で失敗するが、これは
+# 「設定が無い」ではなく「ls が無い」だけなので判定に使ってはいけない。
+# ここでは docker inspect と docker cp (どちらもコンテナ内バイナリ不要) で確認する。
+CFG_DST=/etc/cwagentconfig/cwagent-config.json
+CFG_SRC=$(docker inspect cwagent \
+  --format "{{range .Mounts}}{{if eq .Destination \"${CFG_DST}\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)
+if [[ -n "${CFG_SRC}" ]]; then
+  echo "cwagent に ${CFG_DST} がマウントされている (host: ${CFG_SRC}): OK"
+else
+  echo "WARN: cwagent に ${CFG_DST} のマウントがありません。compose.yaml の cwagent.volumes を確認してください"
+fi
+
+# 実体をコンテナから取り出して中身まで確認する (ディレクトリとして作られていれば -s が偽になる)
+CFG_TMP=$(mktemp 2>/dev/null || echo "/tmp/cwagent-config.$$")
+if MSYS_NO_PATHCONV=1 docker cp "cwagent:${CFG_DST}" "${CFG_TMP}" 2>/dev/null && [[ -s "${CFG_TMP}" ]]; then
+  echo "コンテナ内の設定ファイルを取得できました ($(wc -c < "${CFG_TMP}" | tr -d ' ') bytes):"
+  sed 's/^/    /' "${CFG_TMP}"
+else
+  echo "WARN: コンテナ内の ${CFG_DST} を取得できません。"
+  echo "      ホスト側の ./compose/cwagent/cwagent-config.json を解決できず、"
+  echo "      Docker が同名の空ディレクトリを作っている可能性があります"
+  echo "      (docker inspect cwagent の Mounts の Source と Type を確認してください)。"
+fi
+rm -f "${CFG_TMP}"
+
 # 偽装 EFS の named volume を front/back/cwagent が共有できているか (同一 volume 名か)
 echo "-- efs-logs volume を参照しているコンテナ --"
 for c in app-front app-back cwagent efs-mock; do
@@ -169,9 +197,12 @@ journal_count() {
 }
 
 echo "-- 14-1) API アクション別の受信件数 (cloudwatch-logs-mock) --"
+TOTAL_REQ=0
 for action in CreateLogGroup CreateLogStream DescribeLogGroups DescribeLogStreams PutLogEvents; do
   cnt=$(journal_count "Logs_20140328.${action}" || true)
-  printf '  %-20s : %s 件\n' "${action}" "${cnt:-0}"
+  cnt="${cnt:-0}"
+  printf '  %-20s : %s 件\n' "${action}" "${cnt}"
+  TOTAL_REQ=$((TOTAL_REQ + cnt))
 done
 
 PUT_COUNT=$(journal_count "Logs_20140328.PutLogEvents" || true)
@@ -187,6 +218,23 @@ else
 
   # 14-2) マウント/設定パス側の問題か (13-2 の自己診断で判定済みの内容を再掲)
   echo "-- 14-2) マウント/設定パスの評価 --"
+
+  # どの API も 1 件も来ていない場合、送信の失敗ではなく「送信を試みていない」状態。
+  # 到達性 (DNS/TCP/署名) ではなく、設定の読み込みかファイル検知を先に疑う。
+  if [[ "${TOTAL_REQ}" -eq 0 ]]; then
+    echo "  cloudwatch-logs-mock へのリクエストが 1 件も無い"
+    echo "  → 送信に失敗しているのではなく、エージェントが送信自体を試みていない"
+    echo "  → 到達性 (名前解決/TCP/署名) ではなく、設定の読み込みとファイル検知を先に疑うこと"
+  fi
+  if echo "${CWA_REPORT:-}" | grep -qF "翻訳済み設定が無い"; then
+    echo "  設定を読み込めていない (翻訳済み設定が生成されていない) → 収集対象ゼロで起動している"
+    echo "  docker compose logs cwagent | grep -E 'Under path :|E!' で translator のエラーを確認すること"
+  fi
+  if echo "${CWA_REPORT:-}" | grep -qF "がディレクトリになっている"; then
+    echo "  設定ファイルがディレクトリとして作られている → ホスト側パスを解決できずマウントに失敗している"
+    echo "  compose の実行ディレクトリと Docker Desktop の File Sharing 設定を確認すること"
+  fi
+
   if echo "${CWA_REPORT:-}" | grep -qF "マウント成立"; then
     echo "  /mnt/logs のマウントは成立している → 原因はマウント以外の可能性が高い"
   else

@@ -35,6 +35,8 @@
 # 環境変数 (compose.yaml で調整可能):
 #   CWA_VERIFY_MOUNTS            検証対象マウントポイント (空白区切り)   既定: /mnt/logs
 #   CWA_VERIFY_CONFIG_DIR        設定ファイル配置ディレクトリ            既定: /etc/cwagentconfig
+#   CWA_VERIFY_CONFIG_FILE       主設定ファイル (存在形態を個別に判定)
+#                                                既定: <CONFIG_DIR>/cwagent-config.json
 #   CWA_VERIFY_EXPECT_OWNER      期待する所有者 uid:gid                  既定: 6301:6302
 #   CWA_VERIFY_EXPECT_MODE       期待するモード (下位 3 桁で比較)        既定: 775
 #   CWA_VERIFY_RECHECK_COUNT     起動後の再評価回数                      既定: 5
@@ -45,6 +47,7 @@
 
 CWA_VERIFY_MOUNTS="${CWA_VERIFY_MOUNTS:-/mnt/logs}"
 CWA_VERIFY_CONFIG_DIR="${CWA_VERIFY_CONFIG_DIR:-/etc/cwagentconfig}"
+CWA_VERIFY_CONFIG_FILE="${CWA_VERIFY_CONFIG_FILE:-${CWA_VERIFY_CONFIG_DIR}/cwagent-config.json}"
 CWA_VERIFY_EXPECT_OWNER="${CWA_VERIFY_EXPECT_OWNER:-6301:6302}"
 CWA_VERIFY_EXPECT_MODE="${CWA_VERIFY_EXPECT_MODE:-775}"
 CWA_VERIFY_RECHECK_COUNT="${CWA_VERIFY_RECHECK_COUNT:-5}"
@@ -265,6 +268,57 @@ report_once() {
   # 4. 設定ファイルの探索と file_path (glob) の実アクセス検証
   # ---------------------------------------------------------------------------
   say "---- cwagent config: ${CWA_VERIFY_CONFIG_DIR} ----"
+
+  # このイメージには ls(1) / cat(1) が入っていないため、ホストから
+  #   docker compose exec cwagent ls /etc/cwagentconfig
+  # を実行すると "exec ls: executable file not found in $PATH" になる。
+  # これは「設定ファイルが無い」ではなく「ls が無い」だけなので、判定材料にしてはいけない。
+  # ここではシェル組み込み (glob と test) だけで存在形態を確定させ、ログに残す。
+  if [ ! -e "$CWA_VERIFY_CONFIG_DIR" ]; then
+    fail "${CWA_VERIFY_CONFIG_DIR} が存在しない = volumes 指定が効いていない"
+  elif [ ! -d "$CWA_VERIFY_CONFIG_DIR" ]; then
+    fail "${CWA_VERIFY_CONFIG_DIR} がディレクトリではない"
+  fi
+
+  # 主設定ファイルの存在形態。ディレクトリになっている場合は、ホスト側のパスを
+  # 解決できなかった Docker が空ディレクトリを作った状態 (典型的なマウント失敗)。
+  if [ -d "$CWA_VERIFY_CONFIG_FILE" ]; then
+    fail "${CWA_VERIFY_CONFIG_FILE} がディレクトリになっている"
+    fail "  = ホスト側の ./compose/cwagent/cwagent-config.json を解決できず Docker が空ディレクトリを作った"
+    fail "  compose を実行したディレクトリと、ファイルの共有設定 (Docker Desktop の File Sharing) を確認すること"
+  elif [ -f "$CWA_VERIFY_CONFIG_FILE" ]; then
+    pass "主設定ファイルが存在する: ${CWA_VERIFY_CONFIG_FILE} (size=$(stat_one '%s' "$CWA_VERIFY_CONFIG_FILE"))"
+  else
+    info "${CWA_VERIFY_CONFIG_FILE} は無い (別名で配置 / CW_CONFIG_CONTENT 経路なら想定内)"
+  fi
+
+  # ls(1) の代わりに glob でディレクトリの中身を列挙する
+  # (「/etc/cwagentconfig の内容」をホストからの exec 無しで確認できるようにする)
+  _n=0
+  set -- "$CWA_VERIFY_CONFIG_DIR"/*
+  if [ -e "$1" ]; then
+    for _e in "$@"; do
+      _t=other
+      [ -f "$_e" ] && _t=file
+      [ -d "$_e" ] && _t=dir
+      info "  entry: ${_e} (${_t} mode=$(stat_one '%a' "$_e") size=$(stat_one '%s' "$_e"))"
+      _n=$((_n + 1))
+    done
+  fi
+  [ "$_n" = "0" ] && info "  ${CWA_VERIFY_CONFIG_DIR} は空 (エントリ 0 件)"
+
+  # translator が生成する実効設定。これが出来ていれば「設定を読み込めた」証跡になる。
+  # 逆に、設定ファイルは置かれているのにこれが出来ない場合は translator 側で失敗しており、
+  # 収集対象がゼロのまま起動している (= ログストリームが作られず送信も発生しない)。
+  if [ -f "$AGENT_TRANSLATED_JSON" ]; then
+    pass "翻訳済み設定あり: ${AGENT_TRANSLATED_JSON} = 設定を読み込めている"
+  elif [ "$STRICT" = "1" ]; then
+    fail "翻訳済み設定が無い: ${AGENT_TRANSLATED_JSON}"
+    fail "  = 設定を読み込めていない。収集対象ゼロで起動しているため送信は一切発生しない"
+    fail "  docker compose logs cwagent の 'Under path :' / 'E!' 行で translator のエラーを確認すること"
+  else
+    info "翻訳済み設定はまだ無い: ${AGENT_TRANSLATED_JSON} (起動直後なら想定内)"
+  fi
 
   CFG_FILES=""
   if [ -d "$CWA_VERIFY_CONFIG_DIR" ]; then

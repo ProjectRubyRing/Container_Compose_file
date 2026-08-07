@@ -1,0 +1,57 @@
+# =============================================================================
+# JBoss EAP 8.1 ビルド時設定スクリプト (jboss-cli.sh --file= / embed-server 方式)
+# 自己証明書 (cacert.crt) を取り込む「JBoss 側のトラストストア」を Elytron に定義する
+# ---------------------------------------------------------------------------
+# 【なぜ JDK の cacerts とは別に JBoss 側にも持たせるのか】
+#   - JDK 同梱 cacerts のコピー (-Djavax.net.ssl.trustStore) は JVM 全体の既定であり、
+#     パブリック CA を含む「広く信頼する」ストア。
+#   - Elytron の trust-manager は「このサーバが明示的に信頼する CA だけ」を持つ
+#     専用ストアで、EAP のサブシステム (client-ssl-context / undertow / remoting /
+#     resource-adapter 等) から参照される。実運用では
+#       keytool -import -alias cacert -file cacert.crt \
+#               -keystore $JBOSS_HOME/standalone/configuration/jboss-truststore.p12
+#     のように、社内 CA の自己署名証明書を JBoss 側へも取り込む運用が一般的。
+#   本構成はこの 2 系統を両方作り、どちらでも同じ HTTPS 接続が通ることを
+#   tls-probe (/tls-probe/check?trust=jdk|jboss) で機械的に確認できるようにする。
+#
+# 【トラストストアの実体を作るのは entrypoint.sh】
+#   ${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12 は
+#   起動のたびに entrypoint.sh が ${PKI_TRUST_DIR}/*.crt から作り直す
+#   (証明書を再発行しても取り込み直され、alias 重複も起きない)。
+#   このスクリプトは「その位置を参照する Elytron のリソース定義」だけを行う。
+#
+# 【required=false にしている理由】
+#   pki volume を付けずに起動した場合など、ファイルが存在しないことがある。
+#   required=true だと EAP が起動に失敗するため、空のストアとして扱わせる
+#   (その場合 HTTPS 検証は当然失敗するが、サーバ自体は起動して原因調査ができる)。
+#
+# 【default-ssl-context を設定しない理由】
+#   Elytron の default-ssl-context を設定すると JVM 既定の SSLContext まで
+#   置き換わり、「JDK トラストストア経由」と「JBoss トラストストア経由」を
+#   区別して検証できなくなる。両者を独立に確認したいので設定しない。
+# =============================================================================
+embed-server --server-config=standalone.xml --std-out=echo
+
+# --- JBoss 側トラストストア (自己証明書 cacert.crt の取り込み先) --------------
+# path は jboss.server.config.dir 相対。type=PKCS12 は entrypoint.sh が
+# keytool -storetype PKCS12 で作るものと一致させること。
+/subsystem=elytron/key-store=appTrustStore:add( \
+    path=jboss-truststore.p12, \
+    relative-to=jboss.server.config.dir, \
+    type=PKCS12, \
+    required=false, \
+    credential-reference={clear-text=${env.JBOSS_TRUSTSTORE_PASSWORD:changeit}} \
+)
+
+# --- トラストマネージャ (上記ストアでサーバ証明書を検証する) ------------------
+/subsystem=elytron/trust-manager=appTrustManager:add(key-store=appTrustStore)
+
+# --- 発信 (クライアント) 用 SSL コンテキスト ----------------------------------
+# EAP から外部の HTTPS エンドポイント (secure-api / ALB) を呼ぶときに使う。
+# key-manager を持たない = クライアント証明書は提示しない (サーバ検証のみ)。
+/subsystem=elytron/client-ssl-context=appClientSslContext:add( \
+    trust-manager=appTrustManager, \
+    protocols=["TLSv1.3","TLSv1.2"] \
+)
+
+stop-embedded-server

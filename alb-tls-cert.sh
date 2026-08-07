@@ -3,7 +3,8 @@
 # ALB (nginx) の HTTPS リスナーに適用するサーバ証明書を切り替える
 # ---------------------------------------------------------------------------
 #   ./alb-tls-cert.sh selfsigned  → 自己署名リーフ証明書を適用 (既定)
-#   ./alb-tls-cert.sh ca-issued   → 中間 CA が発行した証明書を適用 (ACM 発行相当)
+#   ./alb-tls-cert.sh ca-issued   → 自己証明書 cacert.crt が発行した証明書を適用
+#                                    (ACM 発行相当)
 #   ./alb-tls-cert.sh status      → 現在適用中の証明書と、実際に提示される証明書を表示
 #
 # 仕組み: compose/alb/tls/variants/ の該当ファイルを
@@ -12,8 +13,10 @@
 #         再ビルド・再生成は不要 (切り替えは即時)。
 #
 # どちらのパターンでも front/back は検証に成功する:
-#   selfsigned → トラストストアに「その自己署名証明書そのもの」が入っている
-#   ca-issued  → トラストストアに「中間 CA + ルート CA」が入っている
+#   selfsigned → トラストストアに「その自己署名リーフ証明書そのもの」が入っている
+#                (trust/alb-selfsigned.crt)
+#   ca-issued  → トラストストアに「自己証明書 cacert.crt」が入っている
+#                (trust/cacert.crt。CA が同じなら証明書を入れ替えても更新不要)
 # 詳細は docs/TLS-SELF-SIGNED-ALB.md を参照。
 # =============================================================================
 set -euo pipefail
@@ -40,7 +43,7 @@ case "${1:-}" in
     ;;
   ca-issued)
     cp "${TLS_DIR}/variants/10-server-cert.ca-issued.conf" "${ACTIVE}"
-    echo "ALB HTTPS リスナー証明書: 中間 CA 発行 (/pki/alb/ca-issued/)"
+    echo "ALB HTTPS リスナー証明書: 自己証明書 cacert.crt 発行 (/pki/alb/ca-issued/)"
     reload_nginx
     ;;
   status)
@@ -49,9 +52,9 @@ case "${1:-}" in
     grep -v '^\s*#' "${ACTIVE}" | grep -v '^\s*$' || true
     echo "-----------------------------------------------------------------"
     if grep -q "selfsigned" "${ACTIVE}"; then
-      echo "→ 自己署名証明書パターンです。"
+      echo "→ 自己署名リーフ証明書パターンです (trust/alb-selfsigned.crt で検証)。"
     else
-      echo "→ 中間 CA 発行証明書パターンです。"
+      echo "→ cacert.crt 発行証明書パターンです (trust/cacert.crt で検証)。"
     fi
     echo ""
     echo "ALB が実際に提示している証明書 (localhost:9443):"

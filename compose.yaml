@@ -8,7 +8,7 @@
 #   jaeger                    → X-Ray コンソールの代替 (トレース可視化 UI)
 #   mysql (8.4.7)             → Aurora MySQL 8.4 (Serverless v2) + RDS Proxy の代替
 #                               (Aurora MySQL 8.4 互換のコミュニティ版 8.4.7 を使用)。
-#                               TLS は pki-init 発行の CA 発行証明書 + 平文拒否で
+#                               TLS は pki-init 発行 (cacert.crt 発行) の証明書 + 平文拒否で
 #                               RDS Proxy 相当にそろえる (docs/RDS-PROXY-TLS.md)
 #   valkey                    → ElastiCache for Valkey の代替
 #   svf-mock (WireMock)       → ALB 越しの SVF 帳票サーバの代替
@@ -24,12 +24,14 @@
 #   cloudwatch-logs-mock      → CloudWatch Logs API のスタブ (WireMock)。cwagent からの
 #                               PutLogEvents を受信し、request journal で送信内容を確認
 #   pki-init                  → AWS Private CA (ACM PCA) / 社内 CA / Amazon RDS CA の
-#                               代替。自己署名のルート CA → 中間 CA → 各サーバ証明書
-#                               (secure-api / ALB / MySQL) を発行し、named volume
-#                               (pki) で全コンテナへ配る
-#   secure-api                → 自己署名証明書で HTTPS のみを受け付ける REST API サーバ
+#                               代替。自己証明書 (自己署名 CA) cacert.crt と、それが
+#                               発行する各サーバ証明書 (secure-api / ALB / MySQL) を
+#                               発行し、named volume (pki) で全コンテナへ配る
+#   secure-api                → ★接続確認用のテスト接続先。cacert.crt 発行の証明書で
+#                               HTTPS のみを受け付ける REST API サーバ
 #                               (WireMock を --disable-http で起動)。front/back は
-#                               JVM トラストストアへ CA を取り込んで呼び出す
+#                               cacert.crt を JDK と JBoss(Elytron) の両トラストストアへ
+#                               取り込み、その両方の経路で呼び出せることを確認する
 #   alb の HTTPS リスナー      → ACM 証明書を適用した ALB の HTTPS リスナーの代替。
 #                               証明書は自己署名 / 中間 CA 発行を切り替えられる
 #   tls-verifier              → 上記 TLS 経路を機械的に検証する (profiles: verify)
@@ -80,10 +82,18 @@ services:
       TX_NODE_ID: front-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890
-      # --- 自己署名証明書による HTTPS 検証 -----------------------------------
-      # entrypoint.sh がこのディレクトリの *.crt を keytool で JVM トラストストアへ
-      # 取り込み、-Djavax.net.ssl.trustStore で JVM に指定する
+      # --- 自己証明書 (cacert.crt) による HTTPS 検証 --------------------------
+      # entrypoint.sh がこのディレクトリの *.crt (cacert.crt / alb-selfsigned.crt) を
+      # keytool で 2 つのトラストストアへ取り込む:
+      #   1. JDK  … JDK 同梱 cacerts のコピーへ追加し -Djavax.net.ssl.trustStore で指定
+      #   2. JBoss… 下記 JBOSS_TRUSTSTORE_FILE を作り直し、Elytron の
+      #             key-store=appTrustStore / trust-manager=appTrustManager /
+      #             client-ssl-context=appClientSslContext が参照する
       PKI_TRUST_DIR: /mnt/pki/trust
+      # JBoss (Elytron) 側トラストストア。パスは cli/elytron-truststore.cli の
+      # key-store path (jboss.server.config.dir 相対) と一致させること
+      JBOSS_TRUSTSTORE_FILE: /opt/server/standalone/configuration/jboss-truststore.p12
+      JBOSS_TRUSTSTORE_PASSWORD: changeit   # テスト環境用 (本番の値を書かないこと)
       # tls-probe サーブレットの既定の呼び出し先 (GET /tls-probe/check?target=...)
       SECURE_API_URL: https://secure-api:8443/api/v1/ping          # target=direct
       SECURE_API_VIA_ALB_URL: https://alb/secure/v1/ping           # target=alb
@@ -159,8 +169,11 @@ services:
       TX_NODE_ID: back-local-1
       # ECS ではタスク起動時にエージェントが注入する。ローカルではモックを指す
       ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-2345678901
-      # --- 自己署名証明書による HTTPS 検証 (front と同一設定) ---------------
+      # --- 自己証明書 (cacert.crt) による HTTPS 検証 (front と同一設定) ------
+      # JDK と JBoss(Elytron) の両トラストストアへ cacert.crt を取り込む
       PKI_TRUST_DIR: /mnt/pki/trust
+      JBOSS_TRUSTSTORE_FILE: /opt/server/standalone/configuration/jboss-truststore.p12
+      JBOSS_TRUSTSTORE_PASSWORD: changeit   # テスト環境用 (本番の値を書かないこと)
       SECURE_API_URL: https://secure-api:8443/api/v1/ping          # target=direct
       SECURE_API_VIA_ALB_URL: https://alb/secure/v1/ping           # target=alb
     # 偽装 EFS (named volume)。front と同じ 2 マウントポイントを共有する
@@ -256,13 +269,14 @@ services:
       # が出る (RDS Proxy では起こり得ない状態)。
       - --auto_generate_certs=OFF
       # pki-init が発行した CA 発行のサーバ証明書 (RDS Proxy が提示する
-      # Amazon RDS CA 発行証明書に相当)。リーフ + 中間 CA の fullchain を渡すことで
-      # クライアントへ中間 CA まで提示できる。
+      # Amazon RDS CA 発行証明書に相当)。発行元は自己証明書 cacert.crt。
+      # fullchain (リーフ + cacert) を渡すことでクライアントへチェーンを提示できる。
       - --ssl_cert=/mnt/pki/rds-proxy/fullchain.crt
       - --ssl_key=/mnt/pki/rds-proxy/server.key
       # 本来はクライアント証明書の検証用だが、mysqld は起動時に自分のサーバ証明書も
       # この CA で検証する。省略すると MY-015010 / MY-015011 の警告が出る。
-      - --ssl_ca=/mnt/pki/ca/ca-chain.crt
+      # トラストアンカーは自己証明書 1 枚なので cacert.crt をそのまま渡す。
+      - --ssl_ca=/mnt/pki/ca/cacert.crt
       # 平文接続を拒否 (RDS Proxy の "Require Transport Layer Security" 相当)。
       # Unix ソケットは対象外なので初期化スクリプトには影響しない。
       - --require_secure_transport=ON
@@ -446,7 +460,11 @@ services:
       # 起動時の自己診断が FAIL でなければ healthy。
       # (再評価の結果は /tmp/cwagent-verify.latest.result に入るが、アプリの
       #  ログ書き込みタイミングに依存するため healthcheck には使わない)
-      test: ["CMD-SHELL", "test -s /tmp/cwagent-verify.boot.result && ! grep -q FAIL /tmp/cwagent-verify.boot.result"]
+      # このイメージには ls/cat/grep 等の外部コマンドが入っていないため、
+      # 判定はシェル組み込み (read / test) だけで完結させる。
+      # ファイルが無い・空の場合は read が EOF で非 0 になるので unhealthy になる。
+      # ($$ は compose の変数展開を避けてコンテナ内シェルへ $ を渡すためのエスケープ)
+      test: ["CMD-SHELL", "read -r v < /tmp/cwagent-verify.boot.result && [ \"$$v\" != FAIL ]"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -581,21 +599,25 @@ services:
       start_period: 5s
 
   # ===========================================================================
-  # 自己署名証明書による HTTPS 検証 (pki-init / secure-api / tls-verifier)
+  # 自己証明書 (cacert.crt) による HTTPS 検証 (pki-init / secure-api / tls-verifier)
   # ---------------------------------------------------------------------------
-  #   pki-init      → 自己署名のルート CA・中間 CA・サーバ証明書を発行し
+  #   pki-init      → 自己署名 CA (cacert.crt) と各サーバ証明書を発行し
   #                   named volume (pki) で全コンテナへ配る
-  #   secure-api    → HTTPS でのみ待ち受ける REST API サーバ (WireMock)
-  #   app-front/back→ entrypoint が CA / 自己署名証明書を JVM トラストストアへ取り込む
+  #   secure-api    → HTTPS でのみ待ち受ける REST API サーバ (WireMock)。
+  #                   ★app-front / app-back の接続確認用テスト接続先。
+  #                   cacert.crt が発行したサーバ証明書だけを提示する
+  #   app-front/back→ entrypoint が cacert.crt を JDK と JBoss(Elytron) の
+  #                   両トラストストアへ取り込み、その両方で接続確認する
   #   alb           → HTTPS リスナー (:443) に証明書を適用し /secure/* を
   #                   secure-api へ HTTPS で再暗号化して転送
   #   tls-verifier  → 上記を機械的に検証する (docker compose run --rm tls-verifier)
   #
-  # 詳細は docs/TLS-SELF-SIGNED-ALB.md を参照。
+  # トラストアンカーは cacert.crt 1 枚に一本化してある (ルート CA + 中間 CA の
+  # 2 階層は廃止)。詳細は docs/TLS-SELF-SIGNED-ALB.md を参照。
   # ===========================================================================
 
-  # --- 自己署名 PKI の発行 ---------------------------------------------------
-  # ルート CA (自己署名) → 中間 CA → 各サーバ証明書 を発行して named volume に置く。
+  # --- 自己証明書 PKI の発行 -------------------------------------------------
+  # 自己署名 CA (cacert.crt) → 各サーバ証明書 を発行して named volume に置く。
   # 生成は冪等 (2 回目以降は再利用)。作り直したいときは:
   #   docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot
   #   もしくは docker compose down -v で volume ごと削除
@@ -606,23 +628,28 @@ services:
     container_name: pki-init
     environment:
       PKI_ROOT: /pki
-      PKI_DAYS_CA: "3650"          # CA の有効期間 (日)
+      PKI_DAYS_CA: "3650"          # 自己証明書 (CA) の有効期間 (日)
       PKI_DAYS_LEAF: "825"         # サーバ証明書の有効期間 (日)
       PKI_KEYSTORE_PASSWORD: changeit   # secure-api 用 PKCS#12 のパスワード (テスト用)
+      PKI_CA_CN: Local Test Self-Signed CA   # cacert.crt の CN (トラストストア一覧に出る)
       PKI_FORCE_REGENERATE: "0"    # "1" で毎起動時に作り直す
     volumes:
       - pki:/pki
     healthcheck:
-      # 生成完了マーカーと、各コンテナが実際に参照するファイルの存在を確認する
-      test: ["CMD-SHELL", "test -f /pki/.pki-ready && test -f /pki/secure-api/server.p12 && test -f /pki/alb/selfsigned/server.key && test -f /pki/rds-proxy/server.key && test -f /pki/ca/ca-chain.crt && test -f /pki/trust/10-local-test-root-ca.crt"]
+      # 生成完了マーカーと、各コンテナが実際に参照するファイルの存在を確認する。
+      # trust/cacert.crt は front/back が JDK / JBoss 両ストアへ取り込む本命。
+      test: ["CMD-SHELL", "test -f /pki/.pki-ready && test -f /pki/ca/cacert.crt && test -f /pki/secure-api/server.p12 && test -f /pki/alb/selfsigned/server.key && test -f /pki/alb/ca-issued/server.key && test -f /pki/rds-proxy/server.key && test -f /pki/trust/cacert.crt"]
       interval: 3s
       timeout: 3s
       retries: 20
       start_period: 2s
 
-  # --- HTTPS を要求する REST API サーバ --------------------------------------
+  # --- HTTPS を要求する REST API サーバ (★テスト用の接続先) ------------------
+  # app-front / app-back が「JDK / JBoss のトラストストアへ取り込んだ自己証明書
+  # cacert.crt を使って接続できるか」を確認するための接続先。
   # WireMock を HTTPS 専用 (--disable-http) で起動する。
-  # サーバ証明書は pki-init が発行した中間 CA 発行の証明書を PKCS#12 で渡す。
+  # サーバ証明書は pki-init が cacert.crt で発行したものを PKCS#12 で渡すため、
+  # cacert.crt を信頼していないクライアントは必ず PKIX エラーで弾かれる。
   # 平文 HTTP のポートは listen しないため、呼び出し側は必ず TLS を張る必要がある。
   #   GET  https://secure-api:8443/api/v1/ping
   #   GET  https://secure-api:8443/api/v1/items/{id}
@@ -643,7 +670,10 @@ services:
       - ./compose/secure-api/mappings:/home/wiremock/mappings:ro
       - pki:/pki:ro
     ports:
-      - "8543:8443"   # ホストからの確認用: curl --cacert <CA> https://localhost:8543/api/v1/ping
+      # ホストからの確認用:
+      #   docker compose exec -T pki-init cat /pki/ca/cacert.crt > cacert.crt
+      #   curl --cacert cacert.crt https://localhost:8543/api/v1/ping
+      - "8543:8443"
     depends_on:
       pki-init:
         condition: service_healthy
@@ -668,6 +698,8 @@ services:
     profiles: ["verify"]
     environment:
       PKI_DIR: /pki
+      # 検証で使うトラストアンカー = 自己証明書 1 枚
+      CA_BUNDLE: /pki/ca/cacert.crt
       SECURE_API_HOST: secure-api
       SECURE_API_PORT: "8443"
       ALB_HOST: alb

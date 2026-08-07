@@ -49,10 +49,15 @@ RUN curl -fsSL -o "${JBOSS_HOME}/modules/com/mysql/main/mysql-connector-j-${MYSQ
       "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${MYSQL_CONNECTOR_VERSION}/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar" \
  && test -f "${JBOSS_HOME}/modules/com/mysql/main/mysql-connector-j-${MYSQL_CONNECTOR_VERSION}.jar"
 
-# ビルド時に JBoss CLI (embed-server) で JDBC ドライバ登録・XA データソース等を構成
+# ビルド時に JBoss CLI (embed-server) で JDBC ドライバ登録・XA データソース等を構成。
+# elytron-truststore.cli は自己証明書 (cacert.crt) を取り込む JBoss 側トラストストア
+# (key-store / trust-manager / client-ssl-context) を定義する。ストアの実体は
+# entrypoint.sh が起動時に ${PKI_TRUST_DIR}/*.crt から生成する。
 COPY cli/mysql-xa-datasource.cli /tmp/config.cli
+COPY cli/elytron-truststore.cli  /tmp/truststore.cli
 RUN "${JBOSS_HOME}/bin/jboss-cli.sh" --file=/tmp/config.cli \
- && rm -f /tmp/config.cli \
+ && "${JBOSS_HOME}/bin/jboss-cli.sh" --file=/tmp/truststore.cli \
+ && rm -f /tmp/config.cli /tmp/truststore.cli \
  && rm -rf "${JBOSS_HOME}/standalone/configuration/standalone_xml_history" \
  && chown -R 185:0 "${JBOSS_HOME}/standalone" "${JBOSS_HOME}/modules" \
  && chmod -R g=u "${JBOSS_HOME}/standalone"

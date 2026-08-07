@@ -56,31 +56,43 @@ else
   export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+${JAVA_TOOL_OPTIONS} }-javaagent:${ADOT_AGENT_JAR}"
 fi
 
-# --- 自己署名 CA / 自己署名証明書を JVM トラストストアへ取り込む ---------------
+# --- 自己証明書 (cacert.crt) を JDK と JBoss の両トラストストアへ取り込む -------
 # 目的: HTTPS を要求する REST API (secure-api / ALB HTTPS リスナー) の
 #       サーバ証明書を、アプリコードを無改変のまま検証できるようにする。
 #
-# なぜ cacerts を「コピーしてから」使うのか:
-#   コンテナは jboss (UID 185) で動くため ${JAVA_HOME}/lib/security/cacerts を
-#   直接書き換えられない (root 所有)。書き込み可能な場所へコピーして CA を足し、
-#   javax.net.ssl.trustStore でその位置を JVM に教える。
-#   コピー元は JDK 同梱の cacerts なので、パブリック CA の信頼はそのまま残る
-#   (= 自己署名 CA を「追加」するだけで、既存の信頼を壊さない)。
-#
-# なぜ JAVA_TOOL_OPTIONS か:
-#   JBoss の JAVA_OPTS_APPEND でも渡せるが、JAVA_TOOL_OPTIONS は JVM が必ず
-#   解釈するため、jboss-cli など補助 JVM からも同じトラストストアが使われる。
-#
 # 取り込む証明書: ${PKI_TRUST_DIR}/*.crt (pki-init が発行し named volume で共有)
-#   10-local-test-root-ca.crt          ルート CA         ┐ この 2 枚を入れると
-#   20-local-test-intermediate-ca.crt  中間 CA           ┘ CA 発行の証明書を全て信頼
-#   30-alb-selfsigned.crt              ALB の自己署名証明書 (その 1 枚だけを信頼)
-# ファイル名 (拡張子を除く) がそのまま keytool の alias になる。
+#   cacert.crt          ★自己証明書 (自己署名 CA)。この 1 枚で secure-api /
+#                        ALB(ca-issued) / MySQL のサーバ証明書を全て検証できる
+#   alb-selfsigned.crt   ALB に自己署名リーフを適用したとき用 (その 1 枚だけを信頼)
+# ファイル名 (拡張子を除く) がそのまま keytool の alias になる (= cacert)。
+#
+# ■ 取り込み先 1: JDK のトラストストア (JVM 既定)
+#   なぜ cacerts を「コピーしてから」使うのか:
+#     コンテナは jboss (UID 185) で動くため ${JAVA_HOME}/lib/security/cacerts を
+#     直接書き換えられない (root 所有)。書き込み可能な場所へコピーして CA を足し、
+#     javax.net.ssl.trustStore でその位置を JVM に教える。
+#     コピー元は JDK 同梱の cacerts なので、パブリック CA の信頼はそのまま残る
+#     (= 自己証明書を「追加」するだけで、既存の信頼を壊さない)。
+#   なぜ JAVA_TOOL_OPTIONS か:
+#     JBoss の JAVA_OPTS_APPEND でも渡せるが、JAVA_TOOL_OPTIONS は JVM が必ず
+#     解釈するため、jboss-cli など補助 JVM からも同じトラストストアが使われる。
+#
+# ■ 取り込み先 2: JBoss (Elytron) のトラストストア
+#   ${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12 を毎起動で作り直す。
+#   ビルド時の cli/elytron-truststore.cli が
+#     key-store=appTrustStore → trust-manager=appTrustManager
+#                             → client-ssl-context=appClientSslContext
+#   としてこのファイルを参照する。JDK 側と違い「自己証明書だけ」を入れるため、
+#   パブリック CA は一切信頼しない専用ストアになる。
 PKI_TRUST_DIR="${PKI_TRUST_DIR:-/mnt/pki/trust}"
 JVM_TRUSTSTORE_DIR="${JVM_TRUSTSTORE_DIR:-/tmp/pki}"
 JVM_TRUSTSTORE_FILE="${JVM_TRUSTSTORE_FILE:-${JVM_TRUSTSTORE_DIR}/cacerts}"
 # コピー元 cacerts のパスワード (JDK 既定値。テスト環境のため既定のまま使う)
 JVM_TRUSTSTORE_PASSWORD="${JVM_TRUSTSTORE_PASSWORD:-changeit}"
+# JBoss (Elytron) 用トラストストア。パスは elytron-truststore.cli の
+# key-store=appTrustStore の path (jboss.server.config.dir 相対) と一致させること
+JBOSS_TRUSTSTORE_FILE="${JBOSS_TRUSTSTORE_FILE:-${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12}"
+JBOSS_TRUSTSTORE_PASSWORD="${JBOSS_TRUSTSTORE_PASSWORD:-changeit}"
 # true にすると取り込みに失敗した時点で起動を中止する (既定は警告のみで続行)
 TRUSTSTORE_IMPORT_REQUIRED="${TRUSTSTORE_IMPORT_REQUIRED:-false}"
 
@@ -99,8 +111,33 @@ find_source_cacerts() {
   return 1
 }
 
+# ${PKI_TRUST_DIR}/*.crt を指定のキーストアへ全て取り込む。
+# 取り込めた件数を標準出力へ返す ($1=キーストアパス $2=パスワード $3=ログ用ラベル)
+import_certs_into() {
+  local store="$1" storepass="$2" label="$3"
+  local imported=0 failed=0 f alias subject
+  for f in "${PKI_TRUST_DIR}"/*.crt; do
+    [[ -e "${f}" ]] || continue
+    alias="$(basename "${f}" .crt)"
+    if keytool -importcert -noprompt -trustcacerts \
+         -alias "${alias}" -file "${f}" \
+         -keystore "${store}" -storetype PKCS12 -storepass "${storepass}" >/dev/null 2>&1; then
+      subject="$(openssl x509 -in "${f}" -noout -subject 2>/dev/null | sed 's/^subject=//' || echo '(openssl 無し)')"
+      log "truststore[${label}]: imported alias=${alias} subject=${subject}"
+      imported=$((imported + 1))
+    else
+      log "WARN: truststore[${label}] import failed: alias=${alias} file=${f}"
+      failed=$((failed + 1))
+    fi
+  done
+  if (( failed > 0 )); then
+    log "truststore[${label}]: failed=${failed}"
+  fi
+  echo "${imported}"
+}
+
 import_trusted_certs() {
-  local src dst imported=0 failed=0 f alias
+  local src dst imported=0
 
   # 取り込む証明書が無ければ何もしない (pki 未マウントの環境でも起動できるように)
   if [[ ! -d "${PKI_TRUST_DIR}" ]] || ! compgen -G "${PKI_TRUST_DIR}/*.crt" >/dev/null; then
@@ -114,44 +151,77 @@ import_trusted_certs() {
     return 0
   fi
 
+  # ---- 1) JDK 同梱 cacerts のコピーへ追加 ------------------------------------
   if ! src="$(find_source_cacerts)"; then
     log "WARN: JDK 同梱の cacerts が見つかりません"
     [[ "${TRUSTSTORE_IMPORT_REQUIRED}" == "true" ]] && fail "source cacerts not found"
-    return 0
+  else
+    dst="${JVM_TRUSTSTORE_FILE}"
+    mkdir -p "$(dirname "${dst}")"
+    # 毎起動でコピーし直す = alias 重複エラーが起きず、常に最新の CA が反映される
+    cp -f "${src}" "${dst}"
+    chmod 0600 "${dst}"
+    log "truststore[jdk]: ${src} → ${dst} にコピーしました"
+
+    # keytool の -storetype は「コピー元の形式」に合わせる必要があるため、
+    # JDK 側だけは -storetype を渡さず自動判別に任せる (JKS/PKCS12 いずれでも可)
+    local f alias jdk_imported=0
+    for f in "${PKI_TRUST_DIR}"/*.crt; do
+      [[ -e "${f}" ]] || continue
+      alias="$(basename "${f}" .crt)"
+      if keytool -importcert -noprompt -trustcacerts \
+           -alias "${alias}" -file "${f}" \
+           -keystore "${dst}" -storepass "${JVM_TRUSTSTORE_PASSWORD}" >/dev/null 2>&1; then
+        log "truststore[jdk]: imported alias=${alias} subject=$(openssl x509 -in "${f}" -noout -subject 2>/dev/null | sed 's/^subject=//' || echo '(openssl 無し)')"
+        jdk_imported=$((jdk_imported + 1))
+      else
+        log "WARN: truststore[jdk] import failed: alias=${alias} file=${f}"
+      fi
+    done
+
+    if (( jdk_imported > 0 )); then
+      # JVM 全体へトラストストアを指定する。
+      # trustStoreType は指定しない (JKS/PKCS12 は JDK が自動判別するため、
+      # 明示するとコピー元の形式が変わったときに読めなくなる)。
+      export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+${JAVA_TOOL_OPTIONS} }-Djavax.net.ssl.trustStore=${dst} -Djavax.net.ssl.trustStorePassword=${JVM_TRUSTSTORE_PASSWORD}"
+      log "truststore[jdk]: ready (imported=${jdk_imported}) path=${dst}"
+      imported=$((imported + jdk_imported))
+    else
+      log "WARN: truststore[jdk] へ 1 件も取り込めませんでした"
+    fi
   fi
 
-  dst="${JVM_TRUSTSTORE_FILE}"
-  mkdir -p "$(dirname "${dst}")"
-  # 毎起動でコピーし直す = alias 重複エラーが起きず、常に最新の CA が反映される
-  cp -f "${src}" "${dst}"
-  chmod 0600 "${dst}"
-  log "truststore: ${src} → ${dst} にコピーしました"
-
-  for f in "${PKI_TRUST_DIR}"/*.crt; do
-    [[ -e "${f}" ]] || continue
-    alias="$(basename "${f}" .crt)"
-    if keytool -importcert -noprompt -trustcacerts \
-         -alias "${alias}" -file "${f}" \
-         -keystore "${dst}" -storepass "${JVM_TRUSTSTORE_PASSWORD}" >/dev/null 2>&1; then
-      log "truststore: imported alias=${alias} subject=$(openssl x509 -in "${f}" -noout -subject 2>/dev/null | sed 's/^subject=//' || echo '(openssl 無し)')"
-      imported=$((imported + 1))
+  # ---- 2) JBoss (Elytron) 用トラストストアを作り直す -------------------------
+  # 既存ファイルを消してから作る = alias 重複を避け、証明書再発行にも追従する。
+  # 中身は自己証明書のみ (パブリック CA は入れない)。
+  local jb="${JBOSS_TRUSTSTORE_FILE}" jb_imported=0
+  if mkdir -p "$(dirname "${jb}")" 2>/dev/null && rm -f "${jb}" 2>/dev/null; then
+    jb_imported="$(import_certs_into "${jb}" "${JBOSS_TRUSTSTORE_PASSWORD}" "jboss")"
+    if (( jb_imported > 0 )); then
+      chmod 0600 "${jb}" 2>/dev/null || true
+      log "truststore[jboss]: ready (imported=${jb_imported}) path=${jb}"
+      log "truststore[jboss]: Elytron key-store=appTrustStore / trust-manager=appTrustManager / client-ssl-context=appClientSslContext が参照します"
+      imported=$((imported + jb_imported))
     else
-      log "WARN: truststore import failed: alias=${alias} file=${f}"
-      failed=$((failed + 1))
+      log "WARN: truststore[jboss] へ 1 件も取り込めませんでした"
     fi
-  done
+  else
+    log "WARN: ${jb} を作成できません (uid=$(id -u) groups=$(id -G))"
+  fi
+
+  # tls-probe サーブレットが JBoss 側ストアを直接読めるよう位置を渡す
+  export JBOSS_TRUSTSTORE_FILE JBOSS_TRUSTSTORE_PASSWORD
 
   if (( imported == 0 )); then
     log "WARN: 1 件も取り込めませんでした (HTTPS 呼び出しは失敗します)"
     [[ "${TRUSTSTORE_IMPORT_REQUIRED}" == "true" ]] && fail "no certificate imported into truststore"
-    return 0
   fi
 
-  # JVM 全体へトラストストアを指定する。
-  # trustStoreType は指定しない (JKS/PKCS12 は JDK が自動判別するため、
-  # 明示するとコピー元の形式が変わったときに読めなくなる)。
-  export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+${JAVA_TOOL_OPTIONS} }-Djavax.net.ssl.trustStore=${dst} -Djavax.net.ssl.trustStorePassword=${JVM_TRUSTSTORE_PASSWORD}"
-  log "truststore: ready (imported=${imported} failed=${failed}) path=${dst}"
+  # 【重要】明示的に 0 を返す。
+  # 直前の [[ ]] && fail は条件が偽のとき 1 を返し、それが関数の戻り値になる。
+  # 呼び出し側は set -e 下の裸の呼び出しなので、そのままだと
+  # 「警告に留めるつもりの分岐」で起動全体が落ちてしまう。
+  return 0
 }
 
 import_trusted_certs
