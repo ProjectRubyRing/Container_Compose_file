@@ -40,7 +40,7 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 | cwagent (ログ転送) | cwagent (同一イメージ) | 設定の `logs.endpoint_override` で送信先のみ cloudwatch-logs-mock へ差し替え (認証情報はダミー) |
 | cwagent の設定注入 (SSM SecureString → `CW_CONFIG_CONTENT` / `CW_CONFIG_CONTENT_MID`) | cwagent-ssm (同一イメージ, `profiles: ssm-config`) | 「SSM 取得 + KMS 復号」と「環境変数 → `/etc/cwagentconfig` への materialize」だけを偽装し、**設定のマージと解釈は実エージェントに行わせる**。詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md) |
 | CloudWatch Logs | WireMock (cloudwatch-logs-mock) | PutLogEvents 受信スタブ。request journal で送信内容を確認 |
-| AWS Private CA (ACM PCA) / 社内 CA | pki-init (openssl) | 自己証明書 `cacert.crt` (自己署名 CA) → 各サーバ証明書を発行し named volume で共有。トラストアンカーは `cacert.crt` 1 枚 |
+| AWS Private CA (ACM PCA) / 社内 CA | pki-init (openssl) | 自己証明書 `cacert.crt` → 各サーバ証明書を named volume で共有。トラストアンカーは `cacert.crt` 1 枚。**`compose/pki/provided/cacert.crt` に受領済みの証明書を置けばそれをそのまま使う** (無ければ自己署名 CA を自動発行)。鍵なしの受領物では発行専用の `local-test-ca` を併用する |
 | 自己証明書で HTTPS を要求する外部 API | WireMock (secure-api, `--disable-http`) | HTTPS のみ listen。★接続確認用のテスト接続先。front/back は `cacert.crt` を **JDK と JBoss(Elytron) の両トラストストア**へ取り込んで呼び出す。詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) |
 | ALB の HTTPS リスナー + ACM 証明書 | alb (nginx) の `listen 443 ssl` | 証明書は自己署名リーフ / `cacert.crt` 発行を `./alb-tls-cert.sh` で切り替え。`/secure/*` はターゲットへ HTTPS 再暗号化 |
 

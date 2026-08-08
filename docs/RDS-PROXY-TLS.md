@@ -111,15 +111,22 @@ mysqld は起動時、`ssl_ca` に指定された CA 証明書の issuer と sub
 
 ### 3.1 証明書 (pki-init)
 
-既存の PKI (自己証明書 `cacert.crt` = 自己署名 CA) をそのまま使い、
-DB 用のリーフを 1 枚追加する。
+既存の PKI (自己証明書 `cacert.crt`) をそのまま使い、DB 用のリーフを 1 枚追加する。
 
 ```
 /pki/ca/cacert.crt               ← Amazon RDS Root CA / global-bundle.pem 相当
-                                    (トラストアンカーはこの 1 枚)
+                                    (トラストアンカー。受領物 もしくは pki-init が発行)
+/pki/ca/verify-bundle.crt        ← mysqld の --ssl_ca に渡す CA バンドル
 /pki/rds-proxy/server.crt|key    ← RDS Proxy エンドポイントの証明書相当
-/pki/rds-proxy/fullchain.crt     ← mysqld が提示するチェーン (リーフ + cacert)
+/pki/rds-proxy/fullchain.crt     ← mysqld が提示するチェーン (リーフ + 発行元 CA)
 ```
+
+> `verify-bundle.crt` は「このスタックのサーバ証明書を検証できる CA の集合」。
+> 受領した `cacert.crt` に秘密鍵がある場合 (および pki-init の自動発行モード) は
+> `cacert.crt` と同一内容になる。受領物が**証明書のみ (鍵なし)** の場合は、
+> 受領 CA で署名できないため DB のサーバ証明書は `local-test-ca` が発行し、
+> `verify-bundle.crt` は `cacert.crt + local-test-ca.crt` の連結になる。
+> 詳細は [TLS-SELF-SIGNED-ALB.md](TLS-SELF-SIGNED-ALB.md) の 2 章を参照。
 
 > 実 AWS の Amazon RDS は「Root CA → リージョン中間 CA → エンドポイント証明書」の
 > 3 段だが、ローカルでは**トラストストアへ入れる証明書を 1 枚に固定する**ことを
@@ -141,7 +148,7 @@ front/back は `DB_HOST=mysql` で接続するため **`DNS:mysql` が必須**
       - --auto_generate_certs=OFF                      # 自己署名の自動生成をやめる
       - --ssl_cert=/mnt/pki/rds-proxy/fullchain.crt
       - --ssl_key=/mnt/pki/rds-proxy/server.key
-      - --ssl_ca=/mnt/pki/ca/cacert.crt
+      - --ssl_ca=/mnt/pki/ca/verify-bundle.crt         # サーバ証明書の発行元 CA
       - --require_secure_transport=ON                  # 平文接続を拒否
       - --tls_version=TLSv1.2,TLSv1.3
 ```
@@ -244,7 +251,7 @@ docker compose exec mysql openssl x509 -in /mnt/pki/rds-proxy/server.crt -noout 
 
 # 5) チェーン + ホスト名検証で接続できること (= 本番と同じ VERIFY_IDENTITY)
 docker compose exec mysql sh -c \
-  'mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/mnt/pki/ca/cacert.crt \
+  'mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/mnt/pki/ca/verify-bundle.crt \
      -h mysql -uappuser -p"$MYSQL_PASSWORD" -D appdb -e "SELECT 1"'
 
 # 6) 平文接続が拒否されること (ERROR 3159 になれば OK)

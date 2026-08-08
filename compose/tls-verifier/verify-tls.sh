@@ -19,8 +19,16 @@
 set -uo pipefail
 
 PKI_DIR="${PKI_DIR:-/pki}"
-# トラストアンカーは自己証明書 1 枚 (ルート CA + 中間 CA の 2 階層は廃止)
-CA_BUNDLE="${CA_BUNDLE:-${PKI_DIR}/ca/cacert.crt}"
+# サーバ証明書の検証に使う CA バンドル。pki-init が配備する:
+#   受領 cacert.crt に鍵がある / 自動発行モード → cacert.crt と同一内容
+#   受領 cacert.crt が鍵なし                    → cacert.crt + local-test-ca.crt
+CA_BUNDLE="${CA_BUNDLE:-${PKI_DIR}/ca/verify-bundle.crt}"
+# ★受領した (もしくは自動発行された) 自己証明書そのもの。
+#   front/back のトラストストアへ取り込まれる本命であり、
+#   「これ 1 枚で何が検証できるか」を確認するために CA_BUNDLE とは別に見る
+PROVIDED_CA="${PROVIDED_CA:-${PKI_DIR}/ca/cacert.crt}"
+# 受領物に鍵が無いときだけ pki-init が作る、サーバ証明書発行専用のローカル CA
+LOCAL_CA_CERT="${LOCAL_CA_CERT:-${PKI_DIR}/ca/local-test-ca.crt}"
 ALB_SELFSIGNED_CERT="${ALB_SELFSIGNED_CERT:-${PKI_DIR}/alb/selfsigned/server.crt}"
 
 SECURE_API_HOST="${SECURE_API_HOST:-secure-api}"
@@ -50,10 +58,10 @@ info()   { echo "  ---- $*"; }
 # ---------------------------------------------------------------------------
 # 事前チェック: PKI が生成されているか
 # ---------------------------------------------------------------------------
-head1 "0. 自己証明書 (cacert.crt) / サーバ証明書の生成確認"
+head1 "0. 自己証明書 (cacert.crt) / サーバ証明書の配備確認"
 
 for f in "${PKI_DIR}/ca/cacert.crt" \
-         "${PKI_DIR}/ca/cacert.key" \
+         "${PKI_DIR}/ca/verify-bundle.crt" \
          "${PKI_DIR}/secure-api/server.crt" \
          "${PKI_DIR}/secure-api/server.p12" \
          "${PKI_DIR}/alb/selfsigned/server.crt" \
@@ -68,6 +76,34 @@ for f in "${PKI_DIR}/ca/cacert.crt" \
   fi
 done
 
+# --- どのモードで配備されたかを判定する ------------------------------------
+# ca/local-test-ca.crt があれば「受領 cacert.crt に鍵が無い」構成。
+# この場合、受領物はトラストアンカー専用で、サーバ証明書は local-test-ca が発行する。
+if [[ -r "${LOCAL_CA_CERT}" ]]; then
+  MODE_NO_KEY=1
+  info "配備モード: 受領 cacert.crt (鍵なし) + local-test-ca (サーバ証明書の発行元)"
+  info "  受領物はトラストアンカーとしてのみ使われます (鍵が無いと署名できないため)"
+else
+  MODE_NO_KEY=0
+  info "配備モード: cacert.crt が全サーバ証明書の発行元 (鍵あり / 自動発行)"
+fi
+
+# PKI_TRUST_LOCAL_CA=0 の構成か (= front/back が信頼するのは受領 cacert.crt 1 枚だけ)。
+# trust/ に入ったものだけが front/back の JDK / JBoss トラストストアへ取り込まれるので、
+# local-test-ca が trust/ に無ければ JVM からは検証できない。
+# (このコンテナ自身の curl / openssl は ca/verify-bundle.crt をファイルとして直接
+#  読むため影響を受けない。反転するのは項目 8 / 9 の JVM 経路だけ。)
+if (( MODE_NO_KEY == 1 )) && [[ ! -r "${PKI_DIR}/trust/local-test-ca.crt" ]]; then
+  PROVIDED_ONLY_TRUST=1
+  info "PKI_TRUST_LOCAL_CA=0 相当: front/back が信頼するのは受領 cacert.crt 1 枚だけです"
+  info "  → 項目 8 / 9 の JVM からの HTTPS 接続は「失敗するのが期待値」として判定します"
+  info "    (受領 CA 発行でないサーバ証明書は弾かれる、という対照実験)"
+else
+  PROVIDED_ONLY_TRUST=0
+fi
+# 受領した自己証明書のフィンガープリント (トラストストアの中身と突き合わせる)
+PROVIDED_CA_FP="$(openssl x509 -in "${PROVIDED_CA}" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')"
+
 # 旧レイアウト (ルート CA + 中間 CA) が残っていないこと。
 # 残っていると古い CA で発行された証明書を掴んでいる可能性がある。
 if [[ -e "${PKI_DIR}/ca/intermediate-ca.crt" || -e "${PKI_DIR}/ca/ca-chain.crt" ]]; then
@@ -76,29 +112,56 @@ else
   pass "旧レイアウト (ルート CA + 中間 CA) は残っていない = cacert.crt へ一本化済み"
 fi
 
-# cacert.crt が「自己署名 かつ CA」であること
-if openssl verify -CAfile "${CA_BUNDLE}" "${CA_BUNDLE}" >/dev/null 2>&1; then
+# cacert.crt が「自己署名 かつ CA」であること。
+# 受領物が想定どおりの自己証明書かどうかの確認なので PROVIDED_CA を見る。
+if openssl verify -CAfile "${PROVIDED_CA}" "${PROVIDED_CA}" >/dev/null 2>&1; then
   pass "cacert.crt は自己署名 (自分自身で検証できる)"
 else
-  fail "cacert.crt が自己署名になっていません"
+  fail "cacert.crt が自己署名になっていません (受領物が上位 CA 発行の証明書の可能性)"
 fi
-if openssl x509 -in "${CA_BUNDLE}" -noout -text 2>/dev/null | grep -q "CA:TRUE"; then
+if openssl x509 -in "${PROVIDED_CA}" -noout -text 2>/dev/null | grep -q "CA:TRUE"; then
   pass "cacert.crt は CA 証明書 (basicConstraints CA:TRUE)"
 else
   fail "cacert.crt が CA 証明書になっていません (CA:TRUE が無い)"
 fi
+# 有効期限切れの受領物は JVM が必ず弾くため、先に気付けるようにする
+if openssl x509 -in "${PROVIDED_CA}" -noout -checkend 0 >/dev/null 2>&1; then
+  pass "cacert.crt は有効期限内 (notAfter=$(openssl x509 -in "${PROVIDED_CA}" -noout -enddate | sed 's/^notAfter=//'))"
+else
+  fail "cacert.crt の有効期限が切れています (受領物を確認してください)"
+fi
 
-# cacert.crt 1 枚で全サーバ証明書を検証できること (中間証明書は不要)
+# 各サーバ証明書が verify-bundle.crt で検証できること
 for leaf in secure-api/server.crt alb/ca-issued/server.crt rds-proxy/server.crt; do
   if openssl verify -CAfile "${CA_BUNDLE}" "${PKI_DIR}/${leaf}" >/dev/null 2>&1; then
-    pass "証明書チェーン検証: ${leaf} ← cacert.crt"
+    pass "証明書チェーン検証: ${leaf} ← ca/verify-bundle.crt"
   else
     fail "証明書チェーン検証に失敗: ${leaf}"
   fi
 done
 
-info "cacert.crt (トラストアンカー):"
-openssl x509 -in "${CA_BUNDLE}" -noout -subject -issuer 2>/dev/null | sed 's/^/       /'
+# 受領 cacert.crt「単体」で何が検証できるかを明示する。
+# 鍵なしモードでは検証できないのが正しい (暗号的に不可避) ため FAIL にはしない。
+if openssl verify -CAfile "${PROVIDED_CA}" "${PKI_DIR}/secure-api/server.crt" >/dev/null 2>&1; then
+  pass "★cacert.crt 単体で secure-api のサーバ証明書を検証できる (受領物が発行元)"
+else
+  if (( MODE_NO_KEY == 1 )); then
+    info "★cacert.crt 単体では secure-api のサーバ証明書を検証できません (想定どおり)"
+    info "  受領 cacert.crt の秘密鍵が無く、受領 CA で署名できないため。"
+    info "  受領物で確認できるのは項目 7 (JDK / JBoss トラストストアへの取り込み) までです。"
+    info "  cacert.key を compose/pki/provided/ へ置けば全経路を受領 CA で検証できます。"
+  else
+    fail "cacert.crt 単体で secure-api のサーバ証明書を検証できません (発行元が一致していない)"
+  fi
+fi
+
+info "cacert.crt (トラストアンカー / 受領物):"
+openssl x509 -in "${PROVIDED_CA}" -noout -subject -issuer 2>/dev/null | sed 's/^/       /'
+info "       SHA-256: ${PROVIDED_CA_FP}"
+if (( MODE_NO_KEY == 1 )); then
+  info "local-test-ca (サーバ証明書の発行元。受領 CA ではない):"
+  openssl x509 -in "${LOCAL_CA_CERT}" -noout -subject 2>/dev/null | sed 's/^/       /'
+fi
 info "secure-api のサーバ証明書:"
 openssl x509 -in "${PKI_DIR}/secure-api/server.crt" -noout -subject -issuer 2>/dev/null | sed 's/^/       /'
 openssl x509 -in "${PKI_DIR}/secure-api/server.crt" -noout -ext subjectAltName 2>/dev/null | sed 's/^/       /'
@@ -179,7 +242,7 @@ if [[ "${MODE}" == "full" ]]; then
     fail "cacert.crt 未指定なのに成功しました (証明書がパブリック CA 発行になっている?)"
   fi
 
-  head1 "4. 自己証明書 cacert.crt を信頼すれば REST API を呼び出せる (curl)"
+  head1 "4. サーバ証明書の発行元 CA を信頼すれば REST API を呼び出せる (curl)"
   body="$(curl -s --max-time 10 --cacert "${CA_BUNDLE}" "${SECURE_API_BASE}/api/v1/ping")"
   rc=$?
   if (( rc == 0 )) && echo "${body}" | jq -e '.status == "ok"' >/dev/null 2>&1; then
@@ -220,19 +283,21 @@ fi
 if [[ "${MODE}" == "full" ]]; then
   head1 "6. ALB の HTTPS リスナー (証明書適用済み) 経由で REST API を呼ぶ"
 
-  # ALB がどちらの証明書を適用中かを判定する (自己署名リーフ or cacert 発行)。
-  alb_issuer="$(echo | openssl s_client -connect "${ALB_HOST}:${ALB_HTTPS_PORT}" \
-                  -servername "${ALB_HOST}" 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)"
-  alb_subject="$(echo | openssl s_client -connect "${ALB_HOST}:${ALB_HTTPS_PORT}" \
-                  -servername "${ALB_HOST}" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null)"
+  # ALB がどちらの証明書を適用中かを判定する (自己署名リーフ or CA 発行)。
+  # issuer の CN 比較ではなく実際に提示された証明書を検証して判定する。
+  # 鍵なしモードでは ca-issued の issuer が local-test-ca になるため、
+  # cacert.crt の CN と突き合わせる方法では判定できない。
+  echo | openssl s_client -connect "${ALB_HOST}:${ALB_HTTPS_PORT}" \
+           -servername "${ALB_HOST}" 2>/dev/null \
+    | openssl x509 -out /tmp/alb-presented.crt 2>/dev/null
+  alb_subject="$(openssl x509 -in /tmp/alb-presented.crt -noout -subject 2>/dev/null)"
+  alb_issuer="$(openssl x509 -in /tmp/alb-presented.crt -noout -issuer 2>/dev/null)"
   info "ALB が提示した証明書: ${alb_subject}"
   info "                     ${alb_issuer}"
 
-  # issuer の CN が cacert.crt の subject CN と一致すれば CA 発行パターン
-  cacert_cn="$(openssl x509 -in "${CA_BUNDLE}" -noout -subject 2>/dev/null | sed 's/.*CN *= *//')"
-  if [[ -n "${cacert_cn}" ]] && echo "${alb_issuer}" | grep -qF "${cacert_cn}"; then
+  if openssl verify -CAfile "${CA_BUNDLE}" /tmp/alb-presented.crt >/dev/null 2>&1; then
     ALB_TRUST_ARG=(--cacert "${CA_BUNDLE}")
-    info "→ CA 発行パターン (issuer=${cacert_cn})。cacert.crt で検証します"
+    info "→ CA 発行パターン。ca/verify-bundle.crt で検証します"
   else
     ALB_TRUST_ARG=(--cacert "${ALB_SELFSIGNED_CERT}")
     info "→ 自己署名リーフパターン。その証明書自体を信頼して検証します"
@@ -255,11 +320,14 @@ fi
 # ---------------------------------------------------------------------------
 # (C)〜(G) front / back の JVM から呼ぶ ★本命
 # ---------------------------------------------------------------------------
-head1 "7. app-front / app-back の JDK / JBoss 両トラストストアの確認"
+head1 "7. ★受領した cacert.crt が app-front / app-back の JDK / JBoss 両トラストストアに入っているか"
+info "照合対象 (受領物 ${PROVIDED_CA}) の SHA-256: ${PROVIDED_CA_FP}"
 
-# 1 つのストア (jdk / jboss) について、cacert が入っているかを判定する
+# 1 つのストア (jdk / jboss) について、cacert が入っているかを判定する。
+# subject が一致するだけでは同名の別証明書と区別できないため、
+# SHA-256 フィンガープリントで「まさに受領した 1 枚か」まで突き合わせる。
 check_store() {  # $1=表示名 $2=truststore JSON $3=ストア名
-  local name="$1" ts="$2" store="$3" path total has_cacert
+  local name="$1" ts="$2" store="$3" path total has_cacert fp
   if ! echo "${ts}" | jq -e ".stores.\"${store}\".readable == true" >/dev/null 2>&1; then
     fail "${name}: ${store} トラストストアを読めません → $(echo "${ts}" | jq -c ".stores.\"${store}\"" 2>/dev/null || echo "${ts}")"
     return
@@ -267,11 +335,25 @@ check_store() {  # $1=表示名 $2=truststore JSON $3=ストア名
   path="$(echo "${ts}" | jq -r ".stores.\"${store}\".path")"
   total="$(echo "${ts}" | jq -r ".stores.\"${store}\".totalEntries")"
   has_cacert="$(echo "${ts}" | jq -r ".stores.\"${store}\".hasCacert")"
-  if [[ "${has_cacert}" == "true" ]]; then
-    pass "${name}[${store}]: alias=cacert あり — ${path} (全 ${total} 件)"
-    echo "${ts}" | jq -r ".stores.\"${store}\".importedForThisTest[] | \"         + \" + ." 2>/dev/null
-  else
+  fp="$(echo "${ts}" | jq -r ".stores.\"${store}\".cacertSha256 // \"\"")"
+  if [[ "${has_cacert}" != "true" ]]; then
     fail "${name}[${store}]: 自己証明書 (alias=cacert) が入っていません — ${path} (entrypoint の取り込みログを確認)"
+    return
+  fi
+  pass "${name}[${store}]: alias=cacert あり — ${path} (全 ${total} 件)"
+  echo "${ts}" | jq -r ".stores.\"${store}\".importedForThisTest[] | \"         + \" + ." 2>/dev/null
+
+  # フィンガープリント照合 (tls-probe が cacertSha256 を返さない古い WAR では SKIP)
+  if [[ -z "${fp}" ]]; then
+    info "${name}[${store}]: cacertSha256 が取得できないため照合をスキップ (tls-probe.war を再ビルドしてください)"
+  elif [[ -z "${PROVIDED_CA_FP}" ]]; then
+    info "${name}[${store}]: 受領物のフィンガープリントを取得できないため照合をスキップ"
+  elif [[ "${fp}" == "${PROVIDED_CA_FP}" ]]; then
+    pass "${name}[${store}]: ★受領した cacert.crt そのものが入っている (SHA-256 一致)"
+  else
+    fail "${name}[${store}]: alias=cacert の中身が受領物と一致しません (別の証明書が取り込まれています)"
+    info "  取り込み済み: ${fp}"
+    info "  受領物      : ${PROVIDED_CA_FP}"
   fi
 }
 
@@ -294,6 +376,20 @@ check_probe() {  # $1=表示名 $2=probe base $3=target $4=trust(jdk|jboss|none)
   ok="$(echo "${res}" | jq -r '.ok // false' 2>/dev/null)"
   url="$(echo "${res}" | jq -r '.url // "?"' 2>/dev/null)"
   store="$(echo "${res}" | jq -r '.trustStore // "?"' 2>/dev/null)"
+
+  # 受領 cacert.crt 1 枚しか信頼していない構成では、local-test-ca が発行した
+  # サーバ証明書を検証できないので「失敗するのが正しい」。期待値を反転して判定する。
+  if (( PROVIDED_ONLY_TRUST == 1 )); then
+    if [[ "${ok}" == "true" ]]; then
+      fail "${name}[trust=${trust}] → ${url} : 受領 cacert.crt しか信頼していないのに成功しました"
+      info "  local-test-ca がトラストストアへ混入している可能性があります"
+    else
+      pass "${name}[trust=${trust}] → ${url} : 期待どおり失敗 — $(echo "${res}" | jq -r '.error.type // "?"')"
+      info "  受領 CA 発行でないサーバ証明書は弾かれる (= 受領物だけを信頼できている)"
+    fi
+    return
+  fi
+
   if [[ "${ok}" == "true" ]]; then
     status="$(echo "${res}" | jq -r '.httpStatus')"
     tlsproto="$(echo "${res}" | jq -r '.tls.protocol // "?"')"
@@ -346,16 +442,32 @@ check_probe_must_fail "app-back(JVM)"  "${BACK_PROBE}"
 head1 "結果: PASS=${PASS} FAIL=${FAIL}"
 if (( FAIL == 0 )); then
   echo "  すべての検証に成功しました。"
-  echo "  - secure-api は HTTPS のみを受け付け、自己証明書 cacert.crt 発行の証明書を提示している"
-  echo "  - front/back は cacert.crt を JDK と JBoss(Elytron) の両トラストストアへ取り込み、"
-  echo "    どちらの経路でも secure-api の証明書検証に成功している"
+  echo "  - secure-api は HTTPS のみを受け付けている"
+  echo "  - front/back は★受領した cacert.crt そのもの★を JDK と JBoss(Elytron) の"
+  echo "    両トラストストアへ取り込んでいる (SHA-256 が受領物と一致)"
   echo "  - 空のトラストストアでは失敗する = 検証を迂回していない"
-  echo "  - ALB(HTTPS) 経由でも同じ REST API を呼び出せている"
+  if (( MODE_NO_KEY == 1 )); then
+    echo ""
+    echo "  【この構成での注意】受領 cacert.crt に秘密鍵が無いため、サーバ証明書は"
+    echo "  local-test-ca が発行しています。受領物で確認できたのは"
+    echo "  「cacert.crt が JDK / JBoss のトラストストアへ正しく取り込まれること」までです。"
+    if (( PROVIDED_ONLY_TRUST == 1 )); then
+      echo "  HTTPS 接続そのものは、受領 CA 発行でないため期待どおり失敗しています。"
+    else
+      echo "  HTTPS 接続の正常系は local-test-ca 発行の証明書で確認しています。"
+    fi
+    echo "  受領 CA で全経路を検証したい場合は cacert.key を compose/pki/provided/ へ置いてください。"
+  else
+    echo "  - どちらの経路でも secure-api の証明書検証に成功している"
+    echo "  - ALB(HTTPS) 経由でも同じ REST API を呼び出せている"
+  fi
   exit 0
 else
   echo "  ${FAIL} 件の検証に失敗しました。上の FAIL 行を確認してください。"
   echo "  よくある原因:"
   echo "   - pki-init が未実行 / 証明書が古い  → docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot"
+  echo "   - 受領 cacert.crt を差し替えた後、front/back が古いまま → docker compose restart app-front app-back"
+  echo "   - 受領物の内容が想定と違う          → docker compose logs pki-init (subject / 有効期限 / SHA-256 を確認)"
   echo "   - front/back が証明書取り込み前に起動 → docker compose restart app-front app-back"
   echo "   - JBoss 側ストアが未生成            → docker compose logs app-front | grep 'truststore\\[jboss\\]'"
   echo "   - ALB の証明書切り替え直後で reload 未実行 → ./alb-tls-cert.sh status"

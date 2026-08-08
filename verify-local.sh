@@ -56,8 +56,10 @@ fi
 
 # 9-2) mysqld が提示する証明書が CA 発行で、SAN に接続先ホスト名 (mysql) を含むこと。
 #      これが成立しないと sslMode=VERIFY_IDENTITY は張れない (= 本番と同じ検証ができない)。
+#      --ssl-ca には verify-bundle.crt (サーバ証明書を検証できる CA の集合) を渡す。
+#      受領した cacert.crt に秘密鍵がある / 自動発行モードなら cacert.crt と同一内容。
 docker compose exec -T mysql sh -c \
-  'mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/mnt/pki/ca/cacert.crt \
+  'mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/mnt/pki/ca/verify-bundle.crt \
      -h mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -D"$MYSQL_DATABASE" -e "SELECT 1" >/dev/null' \
   && echo "VERIFY_IDENTITY (チェーン + ホスト名検証) で接続: OK" \
   || echo "WARN: VERIFY_IDENTITY で接続できません。rds-proxy 証明書の SAN を確認してください"

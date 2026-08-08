@@ -109,19 +109,29 @@ curl -i http://localhost:9080/maintenance   # 常時: メンテナンス画面�
 
 ## 自己証明書 (cacert.crt) による HTTPS 検証 (secure-api / JDK・JBoss トラストストア / ALB)
 
-自己署名 CA (**`cacert.crt`**) で発行した証明書でのみ HTTPS を受け付ける REST API サーバを
-テスト用の接続先として用意し、**呼び出し元の front/back が `cacert.crt` を JDK と JBoss
+HTTPS でのみ待ち受ける REST API サーバをテスト用の接続先として用意し、
+**呼び出し元の front/back が自己証明書 `cacert.crt` を JDK と JBoss
 (Elytron) の両トラストストアへ取り込むことで、アプリコードを無改変のまま REST API を
 呼び出せる**ことを検証する。ALB 経由も同様に検証できる。
 
+**★すでに発行済み / 連携された `cacert.crt` をそのまま投入できる。**
+`compose/pki/provided/cacert.crt` に置くだけで `pki-init` は CA を新規発行せず、
+その受領物をトラストアンカーとして全コンテナへ配る (置かなければ従来どおり自動発行)。
+
 ```bash
+cp /path/to/受領した/cacert.crt compose/pki/provided/cacert.crt   # ★任意 (無ければ自動発行)
 docker compose up -d --build
+docker compose logs pki-init | grep 'MODE:'   # provided / generate のどちらで動いたか
 ./verify-tls.sh                 # 一括検証 (コンテナ内 + ホストから)
 ./verify-tls.sh quick           # JVM 経路のみ (短時間)
 ```
 
-- `pki-init` が **自己証明書 `cacert.crt` (自己署名 CA) → 各サーバ証明書** を発行し、named volume で全コンテナへ配る
+- `pki-init` が **`cacert.crt` (受領物 or 自動発行) → 各サーバ証明書** を named volume へ配置し全コンテナへ配る
   (トラストアンカーは `cacert.crt` **1 枚に一本化**。ルート CA + 中間 CA の 2 階層は廃止)
+  - 受領物に秘密鍵 `cacert.key` が**無い**場合、受領 CA では署名できないためサーバ証明書は
+    `local-test-ca` が発行する。front/back のトラストストアへ入る `cacert.crt` は常に**受領物そのもの**で、
+    `tls-verifier` が SHA-256 を突き合わせて「まさにその受領物が取り込まれた」ことまで検証する
+  - 受領物を差し替えると SHA-256 の変化を検知して自動で作り直す (`PKI_FORCE_REGENERATE` 不要)
 - `secure-api` (WireMock, `--disable-http`) が **HTTPS でのみ** REST API を提供 (`:8543`)。★接続確認用のテスト接続先
 - `app-front` / `app-back` の entrypoint が `keytool` で `cacert.crt` を **2 か所へ取り込む**
   - **JDK**: 同梱 cacerts のコピーへ追加し `-Djavax.net.ssl.trustStore` で JVM に指定 (パブリック CA の信頼は残る)

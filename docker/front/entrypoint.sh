@@ -60,10 +60,16 @@ fi
 # 目的: HTTPS を要求する REST API (secure-api / ALB HTTPS リスナー) の
 #       サーバ証明書を、アプリコードを無改変のまま検証できるようにする。
 #
-# 取り込む証明書: ${PKI_TRUST_DIR}/*.crt (pki-init が発行し named volume で共有)
-#   cacert.crt          ★自己証明書 (自己署名 CA)。この 1 枚で secure-api /
-#                        ALB(ca-issued) / MySQL のサーバ証明書を全て検証できる
+# 取り込む証明書: ${PKI_TRUST_DIR}/*.crt (pki-init が配備し named volume で共有)
+#   cacert.crt          ★自己証明書 (トラストアンカー)。
+#                        compose/pki/provided/cacert.crt を置いていれば
+#                        ★連携された受領物そのもの★がここに入る。
+#                        置いていなければ pki-init が自動発行した自己署名 CA。
 #   alb-selfsigned.crt   ALB に自己署名リーフを適用したとき用 (その 1 枚だけを信頼)
+#   local-test-ca.crt    受領 cacert.crt に秘密鍵が無い場合だけ配られる、
+#                        サーバ証明書発行専用のローカル CA (PKI_TRUST_LOCAL_CA=1 のとき)。
+#                        鍵の無い CA 証明書では署名できないため、受領物は
+#                        トラストアンカー専用となり、発行はこちらが担う。
 # ファイル名 (拡張子を除く) がそのまま keytool の alias になる (= cacert)。
 #
 # ■ 取り込み先 1: JDK のトラストストア (JVM 既定)

@@ -275,15 +275,17 @@ services:
       #   [Warning] [MY-010068] CA certificate ca.pem is self signed.
       # が出る (RDS Proxy では起こり得ない状態)。
       - --auto_generate_certs=OFF
-      # pki-init が発行した CA 発行のサーバ証明書 (RDS Proxy が提示する
-      # Amazon RDS CA 発行証明書に相当)。発行元は自己証明書 cacert.crt。
-      # fullchain (リーフ + cacert) を渡すことでクライアントへチェーンを提示できる。
+      # pki-init が配備した CA 発行のサーバ証明書 (RDS Proxy が提示する
+      # Amazon RDS CA 発行証明書に相当)。
+      # fullchain (リーフ + 発行元 CA) を渡すことでクライアントへチェーンを提示できる。
       - --ssl_cert=/mnt/pki/rds-proxy/fullchain.crt
       - --ssl_key=/mnt/pki/rds-proxy/server.key
       # 本来はクライアント証明書の検証用だが、mysqld は起動時に自分のサーバ証明書も
       # この CA で検証する。省略すると MY-015010 / MY-015011 の警告が出る。
-      # トラストアンカーは自己証明書 1 枚なので cacert.crt をそのまま渡す。
-      - --ssl_ca=/mnt/pki/ca/cacert.crt
+      # verify-bundle.crt は「このスタックのサーバ証明書を検証できる CA の集合」。
+      # 受領 cacert.crt に鍵がある (もしくは自動発行モード) なら cacert.crt と同じ内容、
+      # 受領物が鍵なしなら cacert.crt + local-test-ca.crt の連結になる。
+      - --ssl_ca=/mnt/pki/ca/verify-bundle.crt
       # 平文接続を拒否 (RDS Proxy の "Require Transport Layer Security" 相当)。
       # Unix ソケットは対象外なので初期化スクリプトには影響しない。
       - --require_secure_transport=ON
@@ -711,9 +713,23 @@ services:
   # 2 階層は廃止)。詳細は docs/TLS-SELF-SIGNED-ALB.md を参照。
   # ===========================================================================
 
-  # --- 自己証明書 PKI の発行 -------------------------------------------------
-  # 自己署名 CA (cacert.crt) → 各サーバ証明書 を発行して named volume に置く。
-  # 生成は冪等 (2 回目以降は再利用)。作り直したいときは:
+  # --- 自己証明書 PKI の配備 -------------------------------------------------
+  # トラストアンカー cacert.crt を用意し、各サーバ証明書とあわせて named volume に置く。
+  #
+  # ★cacert.crt の入手方法は 2 通り (compose/pki/gen-certs.sh が自動判定)
+  #   (1) provided … あらかじめ発行済み / 連携された cacert.crt を使う ★本命
+  #         compose/pki/provided/cacert.crt を置くだけ。CA の新規発行は行わず、
+  #         受領物をそのままトラストアンカーとして全コンテナへ配る。
+  #         置き場を変えたい場合は .env の PKI_PROVIDED_DIR でホストパスを指定。
+  #         受領物を差し替えると SHA-256 の変化を検知して自動で作り直す。
+  #   (2) generate … 受領物が無い場合に自己署名 CA を発行する (従来動作)
+  #
+  # 受領物に cacert.key が無い場合、受領 CA では署名できないため
+  # サーバ証明書だけは local-test-ca (このコンテナが生成) が発行する。
+  # front/back のトラストストアへ入る cacert.crt は常に★受領物そのもの★。
+  # 詳細は compose/pki/provided/README.md と docs/TLS-SELF-SIGNED-ALB.md を参照。
+  #
+  # 配備は冪等 (入力が変わらなければ 2 回目以降は再利用)。強制的に作り直すには:
   #   docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot
   #   もしくは docker compose down -v で volume ごと削除
   pki-init:
@@ -723,17 +739,36 @@ services:
     container_name: pki-init
     environment:
       PKI_ROOT: /pki
-      PKI_DAYS_CA: "3650"          # 自己証明書 (CA) の有効期間 (日)
+      # 受領済み cacert.crt の投入口 (★コンテナ内パス。固定値)。
+      # 下の volumes の ${PKI_PROVIDED_DIR} は .env で解決される★ホストパス★で、
+      # 別スコープの値。コンテナ側は常に /provided を見る。
+      PKI_PROVIDED_DIR: /provided
+      # auto     … provided/cacert.crt があれば使い、無ければ自動発行
+      # provided … 受領物必須 (無ければ起動失敗させる = 取り違え防止)
+      # generate … 受領物があっても無視して自動発行 (従来動作)
+      PKI_MODE: ${PKI_MODE:-auto}
+      # 受領物に鍵が無いとき、サーバ証明書発行用の local-test-ca を
+      # front/back のトラストストアへ入れるか。
+      #   1 … 入れる (HTTPS 疎通の正常系も確認できる)
+      #   0 … 入れない (信頼するのは受領 cacert.crt 1 枚だけ。HTTPS は失敗するのが期待値)
+      PKI_TRUST_LOCAL_CA: ${PKI_TRUST_LOCAL_CA:-1}
+      PKI_DAYS_CA: "3650"          # 自動発行する場合の CA 有効期間 (日)
       PKI_DAYS_LEAF: "825"         # サーバ証明書の有効期間 (日)
       PKI_KEYSTORE_PASSWORD: changeit   # secure-api 用 PKCS#12 のパスワード (テスト用)
-      PKI_CA_CN: Local Test Self-Signed CA   # cacert.crt の CN (トラストストア一覧に出る)
+      PKI_CA_CN: Local Test Self-Signed CA   # 自動発行時の cacert.crt の CN
       PKI_FORCE_REGENERATE: "0"    # "1" で毎起動時に作り直す
     volumes:
       - pki:/pki
+      # 受領済み自己証明書の投入口 (読み取り専用)。既定は repo 内の
+      # compose/pki/provided/。共有フォルダ等に置きたい場合は .env で
+      # PKI_PROVIDED_DIR=/path/to/dir を指定するとその場所を mount する。
+      - ${PKI_PROVIDED_DIR:-./compose/pki/provided}:/provided:ro
     healthcheck:
-      # 生成完了マーカーと、各コンテナが実際に参照するファイルの存在を確認する。
-      # trust/cacert.crt は front/back が JDK / JBoss 両ストアへ取り込む本命。
-      test: ["CMD-SHELL", "test -f /pki/.pki-ready && test -f /pki/ca/cacert.crt && test -f /pki/secure-api/server.p12 && test -f /pki/alb/selfsigned/server.key && test -f /pki/alb/ca-issued/server.key && test -f /pki/rds-proxy/server.key && test -f /pki/trust/cacert.crt"]
+      # 配備完了マーカーと、各コンテナが実際に参照するファイルの存在を確認する。
+      # trust/cacert.crt は front/back が JDK / JBoss 両ストアへ取り込む本命 (受領物)。
+      # ca/cacert.key は「鍵なしの受領物」では存在しないため条件に含めない。
+      # ca/verify-bundle.crt は mysqld / nginx / tls-verifier が参照する CA バンドル。
+      test: ["CMD-SHELL", "test -f /pki/.pki-ready && test -f /pki/ca/cacert.crt && test -f /pki/ca/verify-bundle.crt && test -f /pki/secure-api/server.p12 && test -f /pki/alb/selfsigned/server.key && test -f /pki/alb/ca-issued/server.key && test -f /pki/rds-proxy/server.key && test -f /pki/trust/cacert.crt"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -765,9 +800,10 @@ services:
       - ./compose/secure-api/mappings:/home/wiremock/mappings:ro
       - pki:/pki:ro
     ports:
-      # ホストからの確認用:
-      #   docker compose exec -T pki-init cat /pki/ca/cacert.crt > cacert.crt
-      #   curl --cacert cacert.crt https://localhost:8543/api/v1/ping
+      # ホストからの確認用 (verify-bundle.crt はサーバ証明書の発行元を含む CA バンドル。
+      # 受領 cacert.crt に鍵がある場合は cacert.crt と同一内容):
+      #   docker compose exec -T pki-init cat /pki/ca/verify-bundle.crt > ca-bundle.crt
+      #   curl --cacert ca-bundle.crt https://localhost:8543/api/v1/ping
       - "8543:8443"
     depends_on:
       pki-init:
@@ -793,8 +829,11 @@ services:
     profiles: ["verify"]
     environment:
       PKI_DIR: /pki
-      # 検証で使うトラストアンカー = 自己証明書 1 枚
-      CA_BUNDLE: /pki/ca/cacert.crt
+      # サーバ証明書の検証に使う CA バンドル (cacert.crt、鍵なし受領時は + local-test-ca.crt)
+      CA_BUNDLE: /pki/ca/verify-bundle.crt
+      # ★受領した自己証明書そのもの。「これ 1 枚で何が検証できるか」を確認するために
+      #   CA_BUNDLE とは別に渡す (tls-verifier の項目 0 / 7 が参照する)
+      PROVIDED_CA: /pki/ca/cacert.crt
       SECURE_API_HOST: secure-api
       SECURE_API_PORT: "8443"
       ALB_HOST: alb

@@ -20,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.KeyStore;
+import java.security.MessageDigest;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
@@ -351,6 +352,12 @@ public class TlsProbeServlet extends HttpServlet {
             json.append("      \"type\": ").append(quote(ks.getType())).append(",\n");
             json.append("      \"totalEntries\": ").append(total).append(",\n");
             json.append("      \"hasCacert\": ").append(ks.containsAlias("cacert")).append(",\n");
+            // alias=cacert の SHA-256 フィンガープリント。
+            // 受領した cacert.crt (ファイル) のフィンガープリントと突き合わせることで、
+            // 「まさにその受領物がトラストストアへ入っている」ことを機械的に確認できる
+            // (subject だけでは同名の別証明書と区別できないため)。
+            json.append("      \"cacertSha256\": ")
+                .append(quote(sha256Of(ks, "cacert"))).append(",\n");
             json.append("      \"importedForThisTest\": [");
             for (int i = 0; i < selfSigned.size(); i++) {
                 json.append(i == 0 ? "\n        " : ",\n        ").append(quote(selfSigned.get(i)));
@@ -369,6 +376,31 @@ public class TlsProbeServlet extends HttpServlet {
     // ------------------------------------------------------------------------
     // ヘルパー
     // ------------------------------------------------------------------------
+
+    /**
+     * キーストア内の指定 alias の証明書の SHA-256 フィンガープリントを
+     * {@code AA:BB:CC:...} 形式 (openssl -fingerprint -sha256 と同じ表記) で返す。
+     * alias が無い / 読めない場合は空文字を返す。
+     */
+    private static String sha256Of(KeyStore ks, String alias) {
+        try {
+            Certificate cert = ks.getCertificate(alias);
+            if (cert == null) {
+                return "";
+            }
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(cert.getEncoded());
+            StringBuilder sb = new StringBuilder(digest.length * 3);
+            for (byte b : digest) {
+                if (sb.length() > 0) {
+                    sb.append(':');
+                }
+                sb.append(String.format("%02X", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
 
     /** JDK 側で実際に使われるトラストストアのパス (未指定なら JDK 既定の cacerts)。 */
     private static String jdkTrustStorePath() {

@@ -47,26 +47,40 @@ run_from_host() {
   fi
 
   mkdir -p "${OUT_DIR}"
-  # コンテナ内の named volume から自己証明書と ALB 自己署名リーフを取り出す
+  # コンテナ内の named volume から取り出す:
+  #   cacert.crt        ★受領した (もしくは自動発行された) 自己証明書そのもの
+  #   verify-bundle.crt  サーバ証明書を検証できる CA バンドル
+  #                      (受領物が鍵なしの場合は cacert.crt + local-test-ca.crt)
   if ! docker compose exec -T pki-init cat /pki/ca/cacert.crt > "${OUT_DIR}/cacert.crt" 2>/dev/null; then
     echo "WARN: pki-init から cacert.crt を取り出せません (docker compose up -d 済みか確認してください)"
     return 1
   fi
+  docker compose exec -T pki-init cat /pki/ca/verify-bundle.crt > "${OUT_DIR}/verify-bundle.crt" 2>/dev/null
   docker compose exec -T pki-init cat /pki/alb/selfsigned/server.crt > "${OUT_DIR}/alb-selfsigned.crt" 2>/dev/null
 
   echo "自己証明書を ${OUT_DIR}/cacert.crt へ取り出しました (ブラウザや他ツールでの検証にも使えます)"
+  if command -v openssl >/dev/null 2>&1; then
+    echo "  SHA-256: $(openssl x509 -in "${OUT_DIR}/cacert.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')"
+    echo "  subject: $(openssl x509 -in "${OUT_DIR}/cacert.crt" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+    # 受領物だけでサーバ証明書を検証できるか (鍵なし受領時は検証できないのが正しい)
+    if ! cmp -s "${OUT_DIR}/cacert.crt" "${OUT_DIR}/verify-bundle.crt"; then
+      echo "  NOTE: 受領した cacert.crt には秘密鍵が無いため、サーバ証明書は local-test-ca が"
+      echo "        発行しています。ホストからの検証には verify-bundle.crt を使います"
+      echo "        (受領物で確認できるのは front/back のトラストストア取り込みまで)"
+    fi
+  fi
   echo ""
 
-  echo "--- 1. secure-api へ cacert.crt 未指定で HTTPS (失敗が期待値) ---"
+  echo "--- 1. secure-api へ CA 未指定で HTTPS (失敗が期待値) ---"
   if curl -s -S -o /dev/null --max-time 5 "https://localhost:8543/api/v1/ping" 2>&1; then
-    echo "  NG: cacert.crt 未指定なのに成功しました"
+    echo "  NG: CA 未指定なのに成功しました"
   else
     echo "  OK: 期待どおり検証に失敗しました (自己証明書は既定では信頼されない)"
   fi
 
-  echo "--- 2. secure-api へ cacert.crt 指定で HTTPS REST 呼び出し (成功が期待値) ---"
+  echo "--- 2. secure-api へ CA 指定で HTTPS REST 呼び出し (成功が期待値) ---"
   curl -s -w "\n  (status: %{http_code})\n" --max-time 10 \
-    --cacert "${OUT_DIR}/cacert.crt" \
+    --cacert "${OUT_DIR}/verify-bundle.crt" \
     "https://localhost:8543/api/v1/ping" \
     | sed 's/^/  /' \
     || echo "  NG: 呼び出しに失敗しました"
@@ -89,8 +103,8 @@ run_from_host() {
   fi
 
   echo "--- 5. ALB(HTTPS) 経由で secure-api の REST を呼ぶ (成功が期待値) ---"
-  # 適用中の証明書 (自己署名リーフ / cacert 発行) のどちらでも検証できるよう両方渡す
-  cat "${OUT_DIR}/cacert.crt" "${OUT_DIR}/alb-selfsigned.crt" > "${OUT_DIR}/alb-trust.crt" 2>/dev/null
+  # 適用中の証明書 (自己署名リーフ / CA 発行) のどちらでも検証できるよう両方渡す
+  cat "${OUT_DIR}/verify-bundle.crt" "${OUT_DIR}/alb-selfsigned.crt" > "${OUT_DIR}/alb-trust.crt" 2>/dev/null
   curl -s -w "\n  (status: %{http_code})\n" --max-time 10 \
     --cacert "${OUT_DIR}/alb-trust.crt" --resolve "alb:9443:127.0.0.1" \
     "https://alb:9443/secure/v1/ping" \
@@ -140,6 +154,10 @@ else
 fi
 echo ""
 echo "参考:"
+echo "  受領した cacert.crt の投入 : compose/pki/provided/cacert.crt に置いて"
+echo "                               docker compose restart pki-init secure-api alb mysql app-front app-back"
+echo "                               (置き場を変える場合は .env の PKI_PROVIDED_DIR)"
+echo "  どのモードで動いたか       : docker compose logs pki-init | grep 'MODE:'"
 echo "  ALB の証明書を切り替える : ./alb-tls-cert.sh selfsigned | ca-issued | status"
 echo "  証明書を作り直す         : docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot"
 echo "                             (その後 docker compose restart app-front app-back alb secure-api)"

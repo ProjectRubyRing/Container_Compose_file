@@ -58,9 +58,11 @@ fi
 # --- 自己証明書 (cacert.crt) を JDK と JBoss の両トラストストアへ取り込む -------
 # 詳細な意図は front/entrypoint.sh の同ブロックのコメントを参照 (両者は同一処理)。
 #   - 取り込む証明書は pki-init が named volume で配る ${PKI_TRUST_DIR}/*.crt
-#       cacert.crt         ★自己証明書 (自己署名 CA)。この 1 枚で secure-api /
-#                           ALB(ca-issued) / MySQL のサーバ証明書を全て検証できる
+#       cacert.crt         ★自己証明書。compose/pki/provided/cacert.crt を置いていれば
+#                           ★受領物そのもの★が入る (無ければ pki-init が自動発行したもの)
 #       alb-selfsigned.crt  ALB に自己署名リーフを適用したとき用
+#       local-test-ca.crt   受領 cacert.crt に秘密鍵が無い場合だけ配られる、
+#                           サーバ証明書発行専用のローカル CA (PKI_TRUST_LOCAL_CA=1 のとき)
 #   - 取り込み先 1 (JDK): jboss(185) は ${JAVA_HOME}/lib/security/cacerts を
 #     書き換えられないため、書き込み可能な場所へコピーしてから追加し、
 #     -Djavax.net.ssl.trustStore で JVM に位置を教える (パブリック CA も残る)

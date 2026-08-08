@@ -5,6 +5,12 @@
 # (pki-init が生成するテスト用証明書。コミットしない)
 .pki-out/
 
+# 受領済み自己証明書の投入口。連携された cacert.crt / 秘密鍵はコミットしない
+# (README.md と .gitkeep だけを管理対象にする)
+compose/pki/provided/*
+!compose/pki/provided/README.md
+!compose/pki/provided/.gitkeep
+
 # Terraform (terraform/ 配下)。.terraform.lock.hcl は再現性のためコミットする
 **/.terraform/*
 *.tfstate

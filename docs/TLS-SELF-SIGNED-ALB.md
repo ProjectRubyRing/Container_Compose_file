@@ -1,7 +1,7 @@
 # 自己証明書 (cacert.crt) による HTTPS 検証 (secure-api / JDK・JBoss トラストストア / ALB)
 
-自己署名 CA (**`cacert.crt`**) が発行した証明書でのみ HTTPS を受け付ける REST API サーバを
-テスト用の接続先として用意し、**呼び出し元の app-front / app-back が `cacert.crt` を
+HTTPS でのみ待ち受ける REST API サーバをテスト用の接続先として用意し、
+**呼び出し元の app-front / app-back が自己証明書 `cacert.crt` を
 JDK と JBoss (Elytron) の両方のトラストストアへ取り込むことで、アプリコードを無改変のまま
 REST API を呼び出せる**ことを検証する構成。ALB (HTTPS リスナー) 経由でも同様に検証できる。
 
@@ -9,14 +9,35 @@ REST API を呼び出せる**ことを検証する構成。ALB (HTTPS リスナ�
 「社内 CA の自己署名ルート証明書を `cacert.crt` という名前で配布し、`keytool` で
 JDK 同梱 `cacerts` と JBoss のトラストストアへインポートする」運用と同じ形。
 
+> ## ★受領済みの `cacert.crt` を使う (provided モード)
+>
+> **すでに発行され、連携されてきた `cacert.crt` をそのまま投入できる。**
+> `compose/pki/provided/cacert.crt` に置くだけで、`pki-init` は CA を新規発行せず
+> 受領物をトラストアンカーとして全コンテナへ配る。
+> 置いていない場合は従来どおり自己署名 CA を自動発行する (`generate` モード)。
+>
+> ```bash
+> cp /path/to/受領した/cacert.crt compose/pki/provided/cacert.crt
+> docker compose up -d --build
+> docker compose logs pki-init | grep 'MODE:'     # provided になっていることを確認
+> ./verify-tls.sh
+> ```
+>
+> 置き場を repo 外にしたい場合は `.env` の `PKI_PROVIDED_DIR` でホストパスを指定する。
+> 詳細は [`compose/pki/provided/README.md`](../compose/pki/provided/README.md) と本書 2 章。
+
 ---
 
 ## 1. 全体像
 
 ```
+      compose/pki/provided/cacert.crt   ← ★受領済み自己証明書 (置けば provided モード)
+                          │ bind mount (:ro)
+                          ▼
                           ┌──────────────────────────────────────────┐
                           │ pki-init (openssl)                        │
-                          │  cacert.crt (自己署名 CA) → 各サーバ証明書 │
+                          │  cacert.crt (受領物 or 自動発行)          │
+                          │    → 各サーバ証明書                       │
                           └──────────────┬───────────────────────────┘
                                          │ named volume: pki (読み取り専用で共有)
         ┌────────────────────────────────┼─────────────────────────────┐
@@ -40,7 +61,7 @@ JDK 同梱 `cacerts` と JBoss のトラストストアへインポートする�
 
 | サービス | 役割 | ポート (ホスト:コンテナ) |
 |---|---|---|
-| `pki-init` | 自己証明書 `cacert.crt` と各サーバ証明書を発行し named volume `pki` へ配置 | なし |
+| `pki-init` | 自己証明書 `cacert.crt` (受領物 or 自動発行) と各サーバ証明書を named volume `pki` へ配置 | なし |
 | `secure-api` | **HTTPS でのみ**待ち受ける REST API (WireMock)。★接続確認用のテスト接続先 | `8543:8443` |
 | `alb` | ALB 代替。HTTPS リスナーを追加 (証明書適用) | `9080:80` / **`9443:443`** |
 | `app-front` / `app-back` | `cacert.crt` を JDK / JBoss 両トラストストアへ取り込み、`tls-probe` から HTTPS 呼び出し | `8080` / `8180` |
@@ -48,25 +69,117 @@ JDK 同梱 `cacerts` と JBoss のトラストストアへインポートする�
 
 ---
 
-## 2. 発行する証明書 (pki-init)
+## 2. cacert.crt の入手方法と配備 (pki-init)
 
-`compose/pki/gen-certs.sh` が起動時に一度だけ発行する (冪等。2 回目以降は再利用)。
+`compose/pki/gen-certs.sh` が起動時に一度だけ配備する
+(冪等。入力が変わらなければ 2 回目以降は再利用)。
+
+### 2-1. 2 つのモード
+
+| モード | 条件 | `cacert.crt` の出どころ |
+|---|---|---|
+| **`provided`** ★本命 | `compose/pki/provided/cacert.crt` がある | **受領物をそのままコピー**。CA の新規発行は行わない |
+| `generate` | 受領物が無い | `pki-init` が自己署名 CA を発行 (従来動作) |
+
+`PKI_MODE` で明示指定もできる。
+
+| `PKI_MODE` | 動作 |
+|---|---|
+| `auto` (既定) | 受領物があれば `provided`、無ければ `generate` |
+| `provided` | 受領物を必須にする。無ければ **`pki-init` を起動失敗させる** (取り違え防止) |
+| `generate` | 受領物があっても無視して自動発行する |
+
+受領した `cacert.crt` を差し替えると、`pki-init` は入力の SHA-256 が変わったことを
+`.pki-source` で検知して**自動で PKI を作り直す** (`PKI_FORCE_REGENERATE` は不要)。
+
+受領物は PEM / DER のどちらでも受け取れる (DER なら PEM へ自動変換)。
+起動時に「自己署名か / `CA:TRUE` か / 有効期限 / SHA-256」を検査してログへ出す。
+
+### 2-2. 受領物に秘密鍵があるかどうかで発行元が変わる ★重要
+
+**秘密鍵の無い CA 証明書はトラストアンカーとしてしか使えない。**
+証明書への署名には CA の秘密鍵が必須なので、`cacert.key` が無い場合、ローカルの
+`secure-api` / `alb` / `mysql` が「受領 CA が発行したサーバ証明書」を提示することは
+**暗号的に不可能**。そこで役割を分離している。
+
+| | (A) `cacert.crt` + `cacert.key` | (B) `cacert.crt` のみ (鍵なし) |
+|---|---|---|
+| サーバ証明書の発行元 | **受領 CA** | `local-test-ca` (pki-init が生成) |
+| `trust/cacert.crt` (front/back が取り込む) | **受領物** | **受領物** (同じ) |
+| `ca/verify-bundle.crt` | `cacert.crt` のみ | `cacert.crt` + `local-test-ca.crt` |
+| 受領 `cacert.crt` 単体で HTTPS 検証 | **できる** | できない (鍵が無いため) |
+| 受領物で確認できること | 全経路 | **トラストストアへの取り込み** (項目 7) |
+
+```
+受領 cacert.crt  → トラストアンカーとして実際に配布・取り込みする対象
+                    (JDK / JBoss トラストストアへ入るのは受領物そのもの)
+local-test-ca    → サーバ証明書を発行するためだけのローカル CA
+```
+
+これにより「受領物が正しく配布・取り込みされているか」は受領物で検証しつつ、
+HTTPS / MySQL / ALB といった他の検証項目はブロックされずに実行できる。
+`cacert.key` を `compose/pki/provided/` へ置けば**自動的に (A) へ昇格**し、
+`local-test-ca` は作られなくなる。
+
+(B) で `PKI_TRUST_LOCAL_CA=0` を指定すると `local-test-ca` をトラストストアへ入れない。
+この場合 front/back が信頼するのは受領 `cacert.crt` 1 枚だけになり、
+`secure-api` への接続は PKIX で失敗する — **それが期待値**
+(= 受領 CA 発行でないサーバ証明書は弾かれる、という対照実験)。
+`tls-verifier` はこの構成を自動検知して項目 8 / 9 の期待値を反転する。
+
+### 2-3. 出力レイアウト
 
 ```
 /pki/
-  ca/cacert.crt|key               ★自己証明書 = 自己署名 CA (CA:TRUE pathlen:0)
-                                    これ 1 枚が唯一のトラストアンカー
-  secure-api/server.crt|key       secure-api のサーバ証明書 (cacert 発行)
-  secure-api/fullchain.crt        リーフ + cacert
+  ca/cacert.crt                   ★自己証明書 (受領物 or 自動発行)。唯一のトラストアンカー
+  ca/cacert.key                   その秘密鍵。generate モード / 受領物に鍵がある場合のみ存在
+  ca/local-test-ca.crt|key        受領物が鍵なしのときだけ生成する発行専用ローカル CA
+  ca/verify-bundle.crt            ★サーバ証明書を検証できる CA の集合
+                                    = cacert.crt (+ 鍵なし時のみ local-test-ca.crt)
+  secure-api/server.crt|key       secure-api のサーバ証明書
+  secure-api/fullchain.crt        リーフ + 発行元 CA
   secure-api/server.p12           WireMock(Jetty) 用 PKCS#12 キーストア
-  alb/ca-issued/server.crt|key    ALB 用 ★パターンA: cacert 発行
+  alb/ca-issued/server.crt|key    ALB 用 ★パターンA: CA 発行
   alb/selfsigned/server.crt|key   ALB 用 ★パターンB: 自己署名リーフ
-  rds-proxy/server.crt|key        MySQL (RDS Proxy 相当, cacert 発行)
+  rds-proxy/server.crt|key        MySQL (RDS Proxy 相当)
   trust/cacert.crt                ★front/back のトラストストアへ入れる本命 (alias=cacert)
   trust/alb-selfsigned.crt        ALB 自己署名リーフを使うとき用 (alias=alb-selfsigned)
+  trust/local-test-ca.crt         鍵なし & PKI_TRUST_LOCAL_CA=1 のときだけ (alias=local-test-ca)
+  .pki-ready                      配備完了マーカー (healthcheck が参照)
+  .pki-source                     入力のシグネチャ (モード / 受領物の SHA-256)。差し替え検知用
 ```
 
 `trust/` 配下のファイル名 (拡張子を除く) が、そのまま `keytool` の alias になる。
+
+`ca/verify-bundle.crt` を参照するのは次の 3 か所。
+`cacert.crt` を直接指していないのは、鍵なし受領時に発行元が `local-test-ca` になるため。
+
+| 参照元 | 設定 |
+|---|---|
+| `mysql` | `--ssl_ca=/mnt/pki/ca/verify-bundle.crt` |
+| `alb` (nginx) | `proxy_ssl_trusted_certificate /pki/ca/verify-bundle.crt` |
+| `tls-verifier` | `CA_BUNDLE=/pki/ca/verify-bundle.crt` |
+
+### 2-4. 環境変数 (pki-init)
+
+`.env` で設定するもの (受領物の扱いに関わる):
+
+| 変数 | 既定値 | 説明 |
+|---|---|---|
+| `PKI_PROVIDED_DIR` | `./compose/pki/provided` | 受領物を置く**ホスト**のディレクトリ。`pki-init` へ `/provided` として read-only で bind mount する |
+| `PKI_MODE` | `auto` | `auto` / `provided` / `generate` (2-1 参照) |
+| `PKI_TRUST_LOCAL_CA` | `1` | 鍵なし受領時に `local-test-ca` をトラストストアへ入れるか |
+
+`compose.yaml` に直書きしているもの (通常は変更不要):
+
+| 変数 | 既定値 | 説明 |
+|---|---|---|
+| `PKI_FORCE_REGENERATE` | `0` | `1` で毎起動時に作り直す |
+| `PKI_DAYS_CA` / `PKI_DAYS_LEAF` | `3650` / `825` | 自動発行時の有効期間 (日) |
+| `PKI_CA_CN` | `Local Test Self-Signed CA` | 自動発行時の `cacert.crt` の CN |
+| `PKI_LOCAL_CA_CN` | `Local Test Server-Issuing CA (no received key)` | `local-test-ca` の CN |
+| `PKI_SECURE_API_SAN` / `PKI_ALB_SAN` / `PKI_RDS_PROXY_SAN` | 各サービス名 + localhost | サーバ証明書の SAN |
+| `PKI_KEYSTORE_PASSWORD` | `changeit` | `secure-api/server.p12` のパスワード |
 
 SAN (subjectAltName) はコンテナ名で名前解決できるように設定している。
 
@@ -190,13 +303,14 @@ JDK 側の `trustStoreType` は**あえて指定していない** (JKS / PKCS12 
 app-front / app-back が「トラストストアへ取り込んだ `cacert.crt` で接続できるか」を
 確認するための接続先。WireMock を `--disable-http` 付きで起動し、
 **平文 HTTP のポートを一切 listen しない**。
-サーバ証明書は pki-init が `cacert.crt` で発行した PKCS#12 をそのまま渡すため、
-**`cacert.crt` を信頼していないクライアントは必ず PKIX エラーで弾かれる**。
+サーバ証明書は pki-init が配備した PKCS#12 をそのまま渡すため、
+**発行元 CA を信頼していないクライアントは必ず PKIX エラーで弾かれる**
+(発行元は受領 `cacert.crt` に鍵があれば受領 CA、無ければ `local-test-ca`)。
 
 ```yaml
 command:
   - --https-port=8443
-  - --https-keystore=/pki/secure-api/server.p12   # cacert 発行の証明書 + 鍵 (+ cacert 同梱)
+  - --https-keystore=/pki/secure-api/server.p12   # サーバ証明書 + 鍵 (+ 発行元 CA 同梱)
   - --keystore-type=PKCS12
   - --keystore-password=changeit
   - --key-manager-password=changeit
@@ -235,7 +349,7 @@ HTTPS リスナーのルーティング (`rules-tls/10-secure-routes.conf`):
 | `/secure/*` | `https://secure-api:8443/api/*` | ターゲットグループのプロトコル = **HTTPS** (再暗号化) |
 | `/async/*`, `/` | `http://app-back:8180` | ターゲットグループのプロトコル = HTTP (ALB で TLS 終端) |
 
-`/secure/*` では `proxy_ssl_verify on` + `proxy_ssl_trusted_certificate /pki/ca/cacert.crt`
+`/secure/*` では `proxy_ssl_verify on` + `proxy_ssl_trusted_certificate /pki/ca/verify-bundle.crt`
 でターゲット証明書も検証している (実 ALB はターゲット証明書を検証しないため、
 挙動を合わせたい場合は `proxy_ssl_verify off` にする)。
 
@@ -287,20 +401,27 @@ docker compose up -d --build
 
 | # | 内容 | 期待値 |
 |---|---|---|
-| 0 | `cacert.crt` が自己署名 + `CA:TRUE`、旧レイアウトが残っていない | OK |
-| 0 | `cacert.crt` **1 枚で** secure-api / alb(ca-issued) / rds-proxy を検証できる | OK |
+| 0 | `cacert.crt` が自己署名 + `CA:TRUE` + 有効期限内、旧レイアウトが残っていない | OK |
+| 0 | 各サーバ証明書を `ca/verify-bundle.crt` で検証できる | OK |
+| 0 | 受領 `cacert.crt` **単体で** secure-api を検証できるか | 鍵ありなら OK / 鍵なしなら不可 (情報表示) |
 | 2 | `secure-api:8080` (平文 HTTP) が listen していない | 接続不可 |
-| 3 | **`cacert.crt` を信頼しない**クライアントからの HTTPS | **失敗** (対照実験) |
-| 4 | `cacert.crt` を信頼したクライアントからの REST 呼び出し | 200 / 201 |
+| 3 | **CA を信頼しない**クライアントからの HTTPS | **失敗** (対照実験) |
+| 4 | 発行元 CA を信頼したクライアントからの REST 呼び出し | 200 / 201 |
 | 5 | サーバが提示するチェーン (openssl s_client) | `Verify return code: 0 (ok)` |
 | 6 | ALB(HTTPS) → secure-api(再暗号化) | 200 |
 | 7 | front/back の **JDK 側と JBoss 側の両方**に `alias=cacert` が入っている | 両方 OK |
+| 7 | ★`alias=cacert` の **SHA-256 が受領した cacert.crt と一致**する | 両方 一致 |
 | 8 | **front/back の JVM から直接 HTTPS 呼び出し** (`trust=jdk` / `trust=jboss`) | 両方 200 |
 | 9 | **front/back の JVM から ALB 経由で呼び出し** (`trust=jdk` / `trust=jboss`) | 両方 200 |
 | 10 | **空のトラストストア** (`trust=none`) での呼び出し | **失敗** (対照実験) |
 
 項目 3 と 10 が「失敗」することが重要で、これにより
 **「トラストストアへ `cacert.crt` を取り込んだから通っている」**ことが証明される。
+
+項目 7 のフィンガープリント照合が、**受領物そのものが取り込まれている**ことの根拠になる
+(subject だけでは同名の別証明書と区別できないため)。
+受領物が鍵なしの場合、`tls-verifier` はそれを自動検知して項目 0 の扱いを情報表示に切り替え、
+`PKI_TRUST_LOCAL_CA=0` のときは項目 8 / 9 の期待値を「失敗」に反転する。
 
 ### 6-2. front / back の JVM から個別に確認する (tls-probe)
 
@@ -374,6 +495,7 @@ curl -s http://localhost:8080/tls-probe/truststore | jq .
       "readable": true,
       "totalEntries": 152,
       "hasCacert": true,
+      "cacertSha256": "3F:A1:...:9C",
       "importedForThisTest": ["cacert => CN=Local Test Self-Signed CA,...",
                               "alb-selfsigned => CN=alb.example.internal,..."]
     },
@@ -382,6 +504,7 @@ curl -s http://localhost:8080/tls-probe/truststore | jq .
       "readable": true,
       "totalEntries": 2,
       "hasCacert": true,
+      "cacertSha256": "3F:A1:...:9C",
       "importedForThisTest": ["cacert => CN=Local Test Self-Signed CA,...",
                               "alb-selfsigned => CN=alb.example.internal,..."]
     }
@@ -389,8 +512,17 @@ curl -s http://localhost:8080/tls-probe/truststore | jq .
 }
 ```
 
-`jdk` の `totalEntries` が 150 前後 (パブリック CA 込み)、`jboss` が 2 になるのが正しい。
+`jdk` の `totalEntries` が 150 前後 (パブリック CA 込み)、`jboss` が 2 になるのが正しい
+(鍵なし受領 + `PKI_TRUST_LOCAL_CA=1` なら `local-test-ca` が加わって 3)。
 **両方の `hasCacert` が `true`** であることが、この検証の中心。
+
+さらに `cacertSha256` を**受領した `cacert.crt` のフィンガープリントと突き合わせる**ことで、
+「同名の別証明書ではなく、まさに受領した 1 枚が入っている」ことまで確認できる。
+
+```bash
+openssl x509 -in .pki-out/cacert.crt -noout -fingerprint -sha256   # 受領物
+curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha256'
+```
 
 失敗時は HTTP 502 と、原因の例外チェーン + `hint` が返る。
 
@@ -409,19 +541,41 @@ curl -s http://localhost:8080/tls-probe/truststore | jq .
 ### 6-3. ホストから直接叩く
 
 ```bash
-# 自己証明書を取り出す (verify-tls.sh が .pki-out/ へ出力する)
-docker compose exec -T pki-init cat /pki/ca/cacert.crt > cacert.crt
+# 自己証明書と CA バンドルを取り出す (verify-tls.sh が .pki-out/ へ出力する)
+docker compose exec -T pki-init cat /pki/ca/cacert.crt        > cacert.crt
+docker compose exec -T pki-init cat /pki/ca/verify-bundle.crt > verify-bundle.crt
 
-curl --cacert cacert.crt https://localhost:8543/api/v1/ping
-curl --cacert cacert.crt --resolve alb:9443:127.0.0.1 https://alb:9443/secure/v1/ping
+curl --cacert verify-bundle.crt https://localhost:8543/api/v1/ping
+curl --cacert verify-bundle.crt --resolve alb:9443:127.0.0.1 https://alb:9443/secure/v1/ping
+
+# 受領物のフィンガープリント (front/back のトラストストアの中身と突き合わせる)
+openssl x509 -in cacert.crt -noout -fingerprint -sha256
+curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha256'
 ```
+
+受領した `cacert.crt` に秘密鍵がある場合 (および自動発行モード) は
+`verify-bundle.crt` と `cacert.crt` の内容は同一なので、どちらを使ってもよい。
 
 `--resolve` を使うのは、ALB 証明書の SAN が `DNS:alb` のため
 (`DNS:localhost` も入れてあるので `https://localhost:9443/...` でも検証できる)。
 
 ---
 
-## 7. 証明書を作り直す
+## 7. 証明書を入れ替える / 作り直す
+
+### 7-1. 受領した cacert.crt を差し替える
+
+```bash
+cp /path/to/新しい/cacert.crt compose/pki/provided/cacert.crt
+docker compose restart pki-init
+docker compose restart secure-api alb mysql app-front app-back
+docker compose logs pki-init | grep -E 'MODE:|SHA-256'
+```
+
+`PKI_FORCE_REGENERATE` は不要。`pki-init` は受領物の SHA-256 を `.pki-source` に
+記録しており、差し替えを検知すると自動で PKI 一式を作り直す。
+
+### 7-2. 自動発行モードで作り直す
 
 ```bash
 docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot
@@ -443,7 +597,9 @@ volume ごと消す場合は `docker compose down -v` (MySQL 等のデータも�
 
 | ローカル | 実 AWS |
 |---|---|
+| `compose/pki/provided/cacert.crt` (受領物) | 社内 CA / 取引先から連携される自己署名ルート証明書そのもの |
 | `pki-init` の `cacert.crt` | AWS Private CA (ACM PCA) のルート CA / 社内 CA の自己署名証明書 |
+| `local-test-ca` (鍵なし受領時のみ) | ローカル専用。実 AWS には対応物が無い (受領 CA の鍵を持たないための代替) |
 | `secure-api` (WireMock HTTPS) | 自己証明書で HTTPS を要求する外部 API / 社内システム |
 | `alb` の HTTPS リスナー | ALB の HTTPS リスナー + ACM 証明書 |
 | `/secure/*` の `proxy_ssl_*` | ターゲットグループのプロトコル = HTTPS (再暗号化) |
@@ -468,6 +624,12 @@ ECS タスク定義へ持ち込む場合の注意:
 
 | 症状 | 原因 / 対処 |
 |---|---|
+| 受領した `cacert.crt` が使われていない | `docker compose logs pki-init \| grep 'MODE:'` が `generate` なら受領物を認識していない。`compose/pki/provided/cacert.crt` のパス / ファイル名を確認 (`.env` で `PKI_PROVIDED_DIR` を変えている場合はそのパス)。確実に失敗させたいなら `.env` に `PKI_MODE=provided` |
+| `cacert.crt を X.509 証明書として読めません` | 受領物が PEM / DER のどちらでもない (テキスト混入、破損、PKCS#7 / PKCS#12 など)。`openssl x509 -in cacert.crt -noout -text` で確認 |
+| `cacert.key は cacert.crt の秘密鍵ではありません` | 鍵と証明書の取り違え。`openssl x509 -in cacert.crt -noout -pubkey` と `openssl pkey -in cacert.key -pubout` を比較 |
+| 受領物を差し替えたのに反映されない | `pki-init` を再起動していない。`docker compose restart pki-init` 後に `secure-api alb mysql app-front app-back` も再起動する |
+| 項目 7 で「受領物と一致しません」 | トラストストアに別の `cacert` が残っている。`docker compose restart app-front app-back` (entrypoint が毎起動で作り直す)。それでも直らなければ `docker compose logs pki-init \| grep SHA-256` と突き合わせる |
+| 項目 8 / 9 が `PKIX path building failed` で失敗する (鍵なし受領時) | `PKI_TRUST_LOCAL_CA=0` になっていれば**期待どおり**。正常系も確認したい場合は `1` (既定) に戻すか、`cacert.key` を `compose/pki/provided/` へ置く |
 | `PKIX path building failed` (`trust=jdk`) | JDK 側へ取り込めていない。`curl -s http://localhost:8080/tls-probe/truststore \| jq .stores.jdk` で `hasCacert` を確認。`false` なら `docker compose logs app-front \| grep 'truststore\[jdk\]'` |
 | `PKIX path building failed` (`trust=jboss`) | JBoss 側ストアが空か古い。`docker compose logs app-front \| grep 'truststore\[jboss\]'`。ファイルを作れていない場合は `${JBOSS_HOME}/standalone/configuration` の書き込み権限 (UID 185) を確認 |
 | `トラストストアを読めません: .../jboss-truststore.p12` | entrypoint がストアを生成する前に落ちている。`PKI_TRUST_DIR` に `*.crt` があるか確認 |
@@ -484,8 +646,15 @@ ECS タスク定義へ持ち込む場合の注意:
 
 ## 10. セキュリティ上の注意 (テスト環境専用)
 
+- **受領した証明書 / 秘密鍵はコミットしないこと。** `compose/pki/provided/` は
+  `README.md` と `.gitkeep` を除いて `.gitignore` 済み。イメージにも含めない
+  (`compose/pki/.dockerignore` でビルドコンテキストから除外している)。
+- 受領物に `cacert.key` が含まれる場合、それは **CA の秘密鍵** であり、
+  持っている人は任意のサーバ証明書を発行できる。ローカル検証用途に限り、
+  取り扱い範囲を必ず確認すること。
 - 秘密鍵はパスフレーズ無し・`mode 0644` で volume に置いている
   (コンテナごとに実行ユーザが異なるため)。**本番でこの構成にしないこと。**
+  受領した `cacert.key` も同じ扱いで volume へコピーされる点に注意。
 - キーストア / トラストストアのパスワードは `changeit` (JDK 既定値) を直書きしている。
 - 生成される証明書はすべてローカル検証専用で、外部から検証できる CA では発行されない。
 - `cacert.crt` は `CA:TRUE` の CA 証明書。これをトラストストアへ入れるということは
