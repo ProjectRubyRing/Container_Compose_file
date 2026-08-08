@@ -1,0 +1,22 @@
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/mnt/logs/front/logs/*.log",
+            "log_group_name": "/local/myapp/ssm/mid/front",
+            "log_stream_name": "front-mid-ssm",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/mnt/logs/back/logs/*.log",
+            "log_group_name": "/local/myapp/ssm/mid/back",
+            "log_stream_name": "back-mid-ssm",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  }
+}

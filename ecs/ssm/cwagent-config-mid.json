@@ -1,0 +1,24 @@
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/mnt/logs/front/logs/*.log",
+            "log_group_name": "/ecs/<APP_NAME>/<ENV>/efs/front-middleware",
+            "log_stream_name": "{ip_address}",
+            "timezone": "UTC",
+            "retention_in_days": 30
+          },
+          {
+            "file_path": "/mnt/logs/back/logs/*.log",
+            "log_group_name": "/ecs/<APP_NAME>/<ENV>/efs/back-middleware",
+            "log_stream_name": "{ip_address}",
+            "timezone": "UTC",
+            "retention_in_days": 30
+          }
+        ]
+      }
+    }
+  }
+}

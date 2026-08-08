@@ -1,0 +1,44 @@
+# このファイルを terraform.tfvars にコピーして値を設定する
+# (terraform.tfvars は .gitignore 済み)
+
+aws_region = "ap-northeast-1"
+app_name   = "myapp"
+env        = "prod"
+
+# --- 暗号化キー ---------------------------------------------------------------
+# 既定は AWS 管理キー (alias/aws/ssm)。CMK を使う場合はどちらかを設定する。
+#   a) 新規に作る
+# create_kms_key = true
+#   b) 既存キーを使う (ecs/iam/task-execution-role-policy.json の <KMS_KEY_ID> と合わせる)
+# kms_key_id = "alias/myapp-prod-ssm"
+
+# --- 登録する JSON ------------------------------------------------------------
+# 既定ではリポジトリ内のファイルを読み、<APP_NAME> / <ENV> / <AWS_REGION> /
+# <ACCOUNT_ID> を実値へ置換して登録する。
+# cwagent_config_json_path     = "../ecs/ssm/cwagent-config.json"
+# cwagent_config_mid_json_path = "../ecs/ssm/cwagent-config-mid.json"
+#
+# ローカル compose で検証済みの JSON をそのまま登録したい場合:
+# cwagent_config_json_path     = "../compose/cwagent/ssm/cwagent-config.json"
+# cwagent_config_mid_json_path = "../compose/cwagent/ssm/cwagent-config-mid.json"
+#
+# JSON を直接渡すこともできる (この場合 *_json_path は無視される):
+# cwagent_config_json = <<-EOT
+#   { "agent": { "metrics_collection_interval": 60 } }
+# EOT
+
+# --- パラメータ名 (既定は /<app_name>/<env>/cwagent-config[-mid]) --------------
+# cwagent_config_parameter_name     = "/myapp/prod/cwagent-config"
+# cwagent_config_mid_parameter_name = "/myapp/prod/cwagent-config-mid"
+
+# CW_CONFIG_CONTENT_MID を使わない構成なら false にする
+# register_mid_parameter = true
+
+# Standard(4KB) / Advanced(8KB) / Intelligent-Tiering(必要時のみ昇格)
+# parameter_tier = "Intelligent-Tiering"
+
+tags = {
+  Application = "myapp"
+  Environment = "prod"
+  ManagedBy   = "terraform"
+}

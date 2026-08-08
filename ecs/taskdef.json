@@ -167,10 +167,26 @@
         { "containerPort": 8125, "protocol": "udp", "name": "statsd" },
         { "containerPort": 25888, "protocol": "tcp", "name": "emf" }
       ],
+      "mountPoints": [
+        {
+          "sourceVolume": "cwagentconfig",
+          "containerPath": "/etc/cwagentconfig",
+          "readOnly": false
+        }
+      ],
+      "entryPoint": [
+        "/bin/sh",
+        "-c",
+        "if [ -n \"$CW_CONFIG_CONTENT\" ]; then printf '%s' \"$CW_CONFIG_CONTENT\" > /etc/cwagentconfig/00-cwagent-config.json; fi; if [ -n \"$CW_CONFIG_CONTENT_MID\" ]; then printf '%s' \"$CW_CONFIG_CONTENT_MID\" > /etc/cwagentconfig/10-cwagent-config-mid.json; fi; unset CW_CONFIG_CONTENT CW_CONFIG_CONTENT_MID; exec /opt/aws/amazon-cloudwatch-agent/bin/start-amazon-cloudwatch-agent"
+      ],
       "secrets": [
         {
           "name": "CW_CONFIG_CONTENT",
           "valueFrom": "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/cwagent-config"
+        },
+        {
+          "name": "CW_CONFIG_CONTENT_MID",
+          "valueFrom": "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/cwagent-config-mid"
         }
       ],
       "logConfiguration": {
@@ -182,6 +198,11 @@
           "awslogs-create-group": "true"
         }
       }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "cwagentconfig"
     }
   ]
 }

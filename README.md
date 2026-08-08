@@ -8,6 +8,7 @@ ECS/Fargate 本番構成と、AWS に接続せずローカル完結で等価検�
 compose.yaml                         # ローカル検証用 compose (Jaeger を X-Ray の代替 UI に)
 DESIGN.md                            # 設計判断の根拠・デプロイ手順・トラブルシューティング
 docs/ASYNC-SQS-LAMBDA-ALB.md         # 非同期チェーン (SQS→Lambda→ALB→app-back) 詳細ガイド
+docs/CWAGENT-SSM-CONFIG.md           # CW_CONFIG_CONTENT / CW_CONFIG_CONTENT_MID による設定注入の詳細ガイド
 docs/MYSQL-8.4-AURORA-UPGRADE.md     # Aurora 8.4 / MySQL 8.4.7 化・Connector/J 9.7.0 の詳細解説
 docs/RDS-PROXY-TLS.md                # DB の TLS を RDS Proxy 相当にそろえる設定 / MY-010068 の読み方
 docs/TLS-SELF-SIGNED-ALB.md          # 自己署名証明書 HTTPS / JVM トラストストア / ALB 証明書の詳細ガイド
@@ -15,6 +16,7 @@ docs/TLS-SELF-SIGNED-ALB.md          # 自己署名証明書 HTTPS / JVM トラ�
 verify-local.sh                      # ローカル動作確認スクリプト
 verify-async.sh                      # 非同期チェーンの動作確認スクリプト
 verify-tls.sh                        # 自己署名証明書 HTTPS 経路の動作確認スクリプト
+verify-cwagent-ssm.sh                # cwagent の SSM (SecureString) 設定注入の動作確認スクリプト
 alb-maintenance.sh                   # ALB 全面メンテナンスモードの ON/OFF 切り替え
 alb-tls-cert.sh                      # ALB HTTPS リスナーの証明書切り替え (自己署名 / 中間CA発行)
 compose/
@@ -25,6 +27,8 @@ compose/
   ecs-metadata-mock/mappings/        # ECS Task Metadata Endpoint v4 の WireMock スタブ
   cwagent/cwagent-config.json        # CloudWatch Agent ローカル設定 (endpoint_override → mock)
   cwagent/verify-mount.sh            # cwagent の自己診断ラッパー (マウント/権限/設定パスを検証しログ出力)
+  cwagent/ssm-config-entrypoint.sh   # SSM SecureString → CW_CONFIG_CONTENT 注入の偽装ラッパー
+  cwagent/ssm/*.json                 # Parameter Store に登録する JSON の実体 (主設定 / 追加設定)
   cloudwatch-logs-mock/mappings/     # CloudWatch Logs API の WireMock スタブ (送信の偽装先)
   sqs/elasticmq.conf                 # SQS のローカル代替 (ElasticMQ) キュー/DLQ 設定
   lambda/app/handler.py              # Lambda 関数 (SQS→ALB→app-back を POST 呼び出し)
@@ -49,10 +53,14 @@ docker/
 ecs/
   taskdef.json                       # Fargate タスク定義 (front/back/ADOT/CW Agent 4 コンテナ)
   ssm/adot-collector-config.yaml     # Parameter Store 登録用 ADOT Collector 設定 (awsxray)
-  ssm/cwagent-config.json            # Parameter Store 登録用 CloudWatch Agent 設定
+  ssm/cwagent-config.json            # Parameter Store 登録用 CW Agent 設定 (→ CW_CONFIG_CONTENT)
+  ssm/cwagent-config-mid.json        # 同 追加設定 (→ CW_CONFIG_CONTENT_MID)
   ssm/register-parameters.sh         # aws ssm put-parameter 登録スクリプト
   iam/task-role-policy.json          # タスクロール (X-Ray / CW メトリクス)
   iam/task-execution-role-policy.json# タスク実行ロール (ECR / logs / SSM / KMS)
+terraform/                           # CW Agent 設定を SecureString で Parameter Store へ登録 + output
+  main.tf, variables.tf, outputs.tf  # 登録内容・確認用 output (名前/ARN/型/ティア/版/sha256)
+  terraform.tfvars.example           # → terraform.tfvars にコピーして app_name / env を設定
 ```
 
 ## ローカル検証 (AWS 非接続)
@@ -231,6 +239,40 @@ curl -s -X POST http://localhost:8480/__admin/requests/count \
   -H "Content-Type: application/json" \
   -d '{"method":"POST","url":"/","headers":{"X-Amz-Target":{"equalTo":"Logs_20140328.PutLogEvents"}}}'
 ```
+
+### cwagent 設定を SSM Parameter Store (SecureString) から注入するパターン
+
+上の `cwagent` は設定ファイルを `/etc/cwagentconfig` へマウントする方式だが、ECS タスク定義と同じ
+**「Parameter Store の SecureString に入れた JSON 文字列を環境変数として受け取る」方式**も、
+別サービス `cwagent-ssm` (`profiles: ssm-config`) として用意してある。
+**既存の `cwagent` は無変更**で、通常の `docker compose up` の挙動も従来どおり。
+
+```bash
+docker compose up -d --build
+docker compose --profile ssm-config up -d cwagent-ssm
+./verify-cwagent-ssm.sh
+```
+
+- `CW_CONFIG_CONTENT` … エージェントが**デフォルトロード**する主設定
+- `CW_CONFIG_CONTENT_MID` … 追加設定。**エージェントが自動で読むのは `CW_CONFIG_CONTENT` だけ**なので、
+  ECS 側でも taskdef の `entryPoint` で `/etc/cwagentconfig/` へ materialize する必要がある
+- 偽装しているのは「SSM から取得して環境変数へ入れる」「環境変数を設定ディレクトリへ流し込む」まで。
+  **設定のマージと解釈は実エージェントがそのまま行う**ため、ローカルで成立した JSON は
+  そのまま Parameter Store へ登録すれば ECS でも同じ実効設定になる
+- ロググループを既存 cwagent (`/local/myapp/efs/*`) と分けてある (`/local/myapp/ssm/*`) ため、
+  `cloudwatch-logs-mock` の request journal でどちらの経路の送信か区別できる
+
+Parameter Store への登録と登録内容の確認は Terraform で行う:
+
+```bash
+cd terraform && cp terraform.tfvars.example terraform.tfvars   # app_name / env を設定
+terraform init && terraform apply
+terraform output parameter_summary          # 名前 / ARN / 型 / ティア / バージョン / サイズ / sha256
+terraform output -raw verify_commands       # AWS CLI での確認コマンド
+terraform output -raw ecs_taskdef_secrets   # taskdef へ貼る secrets ブロック
+```
+
+**実装・設定方法の詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md) を参照。**
 
 #### ログストリームが作られない / イベントが 0 件のとき
 

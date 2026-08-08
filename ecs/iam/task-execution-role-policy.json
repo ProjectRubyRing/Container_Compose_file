@@ -41,6 +41,7 @@
       "Resource": [
         "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/adot-collector-config",
         "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/cwagent-config",
+        "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/cwagent-config-mid",
         "arn:aws:ssm:<AWS_REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/<ENV>/db/password"
       ]
     },

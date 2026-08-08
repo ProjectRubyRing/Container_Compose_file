@@ -4,3 +4,18 @@
 # verify-tls.sh がホスト検証用に named volume から取り出す CA / 証明書
 # (pki-init が生成するテスト用証明書。コミットしない)
 .pki-out/
+
+# Terraform (terraform/ 配下)。.terraform.lock.hcl は再現性のためコミットする
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc

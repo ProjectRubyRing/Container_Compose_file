@@ -38,6 +38,7 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 | SVF 帳票サーバ (ALB) | WireMock (svf-mock) | REST スタブ |
 | EFS (/mnt/logs, /mnt/data。アクセスポイント不使用) | efs-mock + named volume | UID 6301 / GID 6302, mode 2775 (setgid) で初期化。front/back は `group_add: 6302` で書き込み。ホスト側の権限変更は不要 |
 | cwagent (ログ転送) | cwagent (同一イメージ) | 設定の `logs.endpoint_override` で送信先のみ cloudwatch-logs-mock へ差し替え (認証情報はダミー) |
+| cwagent の設定注入 (SSM SecureString → `CW_CONFIG_CONTENT` / `CW_CONFIG_CONTENT_MID`) | cwagent-ssm (同一イメージ, `profiles: ssm-config`) | 「SSM 取得 + KMS 復号」と「環境変数 → `/etc/cwagentconfig` への materialize」だけを偽装し、**設定のマージと解釈は実エージェントに行わせる**。詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md) |
 | CloudWatch Logs | WireMock (cloudwatch-logs-mock) | PutLogEvents 受信スタブ。request journal で送信内容を確認 |
 | AWS Private CA (ACM PCA) / 社内 CA | pki-init (openssl) | 自己証明書 `cacert.crt` (自己署名 CA) → 各サーバ証明書を発行し named volume で共有。トラストアンカーは `cacert.crt` 1 枚 |
 | 自己証明書で HTTPS を要求する外部 API | WireMock (secure-api, `--disable-http`) | HTTPS のみ listen。★接続確認用のテスト接続先。front/back は `cacert.crt` を **JDK と JBoss(Elytron) の両トラストストア**へ取り込んで呼び出す。詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) |
@@ -126,8 +127,39 @@ MySQL 固有の考慮:
 - **タスクロール** (アプリ実行時): X-Ray への書き込み + サンプリング API、
   cwagent 用の `PutMetricData` (namespace 条件付き) と EMF ロググループ
 - **タスク実行ロール** (起動時): ECR pull (リポジトリ限定)、awslogs、
-  `ssm:GetParameters` (3 パラメータに限定)、SecureString 復号用 `kms:Decrypt`
+  `ssm:GetParameters` (パラメータを列挙して限定)、SecureString 復号用 `kms:Decrypt`
   (`kms:ViaService` で SSM 経由に限定)
+
+### 2.7 CloudWatch Agent 設定も SSM Parameter Store から注入 (SecureString)
+
+Collector と同じ考え方で、CW Agent 設定もタスク定義の `secrets` から注入する。
+ただし 2.4 の `AOT_CONFIG_CONTENT` と違い、**複数パラメータに分割する場合に一手間要る**。
+
+- **`CW_CONFIG_CONTENT` (主設定)** はエージェントがデフォルトロードする。
+- **`CW_CONFIG_CONTENT_MID` (追加設定)** のような追加の環境変数は、
+  **エージェントが素のままでは読まない**。エージェントがコンテナ実行時に見るのは
+  `/etc/cwagentconfig` (`--input-dir`) であり、そこに置かれた JSON が**すべてマージ**される。
+  そのため taskdef の `entryPoint` で「環境変数 → `/etc/cwagentconfig/NN-*.json`」の
+  materialize を挟み、エージェント本体のマージ機構に載せている。
+  - 数値プレフィクス (`00-` / `10-`) がマージ順になる
+  - materialize 後に `unset` する。エージェント側にも `CW_CONFIG_CONTENT` を読む経路が
+    あるため、残すと同じ設定が二重に読まれ `collect_list` が重複しうる
+  - `/etc/cwagentconfig` はタスクレベル volume でマウントする
+    (イメージに `mkdir(1)` が無い場合があるため、ディレクトリの存在を外側で保証する)
+- **分割する動機**: パラメータのサイズ上限 (Standard 4KB / Advanced 8KB) の回避と、
+  設定の管理主体を分けること (基盤共通設定 / ミドルウェア個別設定)。
+- **SecureString にする理由**: 値がタスク定義やコンソールの環境変数一覧に平文で残らない。
+  復号はタスク実行ロールが起動時に行うため、アプリ側の実装は変わらない。
+- 登録は `terraform/` (JSON の妥当性検証・サイズ上限チェック・確認用 output 付き)。
+  `ecs/ssm/register-parameters.sh` でも `CWAGENT_SECURESTRING=1` で同じ 2 本を登録できるが、
+  **二重管理になるためどちらか一方に寄せる**。
+- ローカル compose では `cwagent-ssm` サービス (`profiles: ssm-config`) が同じ経路を偽装する。
+  偽装するのは「SSM 取得 + 復号」と「環境変数 → 設定ディレクトリへの流し込み」までで、
+  **マージと設定解釈は実エージェントに行わせる**。これにより
+  「ローカルで成立した JSON = ECS でも同じ実効設定」が担保される。
+  既存の `cwagent` (ファイルマウント方式) は変更していないので、両方式を並べて比較できる。
+
+詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md)。
 
 ---
 
@@ -143,6 +175,11 @@ docker build -f back/Dockerfile  --build-arg EAP_BASE_IMAGE=<EAP_BASE_IMAGE> \
 
 # 2. SSM パラメータ登録 (ecs/ssm/ で)
 AWS_REGION=... APP_NAME=... ENV=... ./register-parameters.sh
+#    CW Agent 設定 (CW_CONFIG_CONTENT / CW_CONFIG_CONTENT_MID) は Terraform でも登録できる:
+#      cd terraform && cp terraform.tfvars.example terraform.tfvars && terraform init && terraform apply
+#      terraform output parameter_summary        # 登録内容の確認
+#      terraform output -raw ecs_taskdef_secrets # taskdef へ貼る secrets ブロック
+#    (register-parameters.sh との二重管理を避け、どちらか一方に寄せること)
 
 # 3. IAM ロール作成 (ecs/iam/ のポリシーをアタッチ)
 
@@ -238,6 +275,15 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
   advanced tier (8KB) にする (`register-parameters.sh` は Intelligent-Tiering 指定済みで自動昇格)。
 - パラメータを更新しても反映されない → secrets はタスク起動時にのみ解決される。
   `--force-new-deployment` で新タスクを起動する。
+- `CW_CONFIG_CONTENT_MID` を足したのに設定が効かない → エージェントが自動でロードするのは
+  `CW_CONFIG_CONTENT` **だけ**。追加変数は taskdef の `entryPoint` で
+  `/etc/cwagentconfig/NN-*.json` へ materialize する必要がある (2.7 節)。
+  materialize 先のディレクトリはタスクレベル volume でマウントしておくこと
+  (イメージに `mkdir(1)` が無い場合がある)。
+- 追加設定を足したら `collect_list` が重複した → materialize 後に環境変数を `unset`
+  していない可能性。エージェント側の `CW_CONFIG_CONTENT` 読み込み経路と二重になる。
+- CW Agent 設定の JSON が壊れている / サイズ上限に触れる → `terraform plan` の時点で
+  `jsondecode` と precondition が検出する (`terraform/`)。
 
 ### ローカル compose 固有
 
@@ -257,3 +303,10 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
   - `glob に一致するファイルが 0 件` → アプリの出力パスと `cwagent-config.json` の
     `file_path` の食い違い
   - `読み取り不可 (open 失敗)` → 偽装 EFS の 6301:6302 権限と `group_add` を確認
+- SSM 注入方式 (`cwagent-ssm`) の確認は `./verify-cwagent-ssm.sh`。
+  `docker compose --profile ssm-config up -d cwagent-ssm` で起動してから実行する
+  (`profiles` でゲートしているため通常の `up` では起動しない)。
+  `[cwagent-ssm]` 行が materialize の結果、`[cwagent-verify]` 行が従来どおりの
+  マウント/権限診断。マージが成立したかは検証スクリプトの 4 (実効設定に両系統の
+  `log_group_name` が載っているか) で判定する。詳細は
+  [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md)。

@@ -20,7 +20,14 @@
 #   cwagent                   → ECS と同じ CloudWatch Agent イメージのサイドカー。
 #                               偽装 EFS 上のログファイルを検知して tail し、
 #                               logs.endpoint_override で cloudwatch-logs-mock へ送信
-#                               (実 CloudWatch Logs には送信しない)
+#                               (実 CloudWatch Logs には送信しない)。
+#                               設定は /etc/cwagentconfig へのファイルマウントで注入
+#   cwagent-ssm               → 同じ CloudWatch Agent イメージだが、設定の注入経路を
+#                               ECS タスク定義と同じ「SSM Parameter Store の
+#                               SecureString → 環境変数 CW_CONFIG_CONTENT /
+#                               CW_CONFIG_CONTENT_MID」に寄せた検証用サービス。
+#                               profiles: ssm-config のため通常の up では起動しない
+#                               (docs/CWAGENT-SSM-CONFIG.md)
 #   cloudwatch-logs-mock      → CloudWatch Logs API のスタブ (WireMock)。cwagent からの
 #                               PutLogEvents を受信し、request journal で送信内容を確認
 #   pki-init                  → AWS Private CA (ACM PCA) / 社内 CA / Amazon RDS CA の
@@ -465,6 +472,94 @@ services:
       # ファイルが無い・空の場合は read が EOF で非 0 になるので unhealthy になる。
       # ($$ は compose の変数展開を避けてコンテナ内シェルへ $ を渡すためのエスケープ)
       test: ["CMD-SHELL", "read -r v < /tmp/cwagent-verify.boot.result && [ \"$$v\" != FAIL ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # ===========================================================================
+  # cwagent (SSM Parameter Store 注入パターン)  ★profiles: ssm-config
+  # ---------------------------------------------------------------------------
+  # 上の cwagent が「設定ファイルを /etc/cwagentconfig へマウントする」パターンなのに対し、
+  # こちらは ECS タスク定義と同じ **「SSM Parameter Store の SecureString に入れた
+  # JSON 文字列を環境変数として受け取る」** パターンを偽装再現する。
+  #
+  #   CW_CONFIG_CONTENT      … デフォルトロードされる主設定 (ECS の secrets と同名)
+  #   CW_CONFIG_CONTENT_MID  … 追加設定。実エージェントは素のままでは読まないため、
+  #                             ECS 側でも同じ materialize 処理を entryPoint で挟む
+  #                             (ecs/taskdef.json の cwagent コンテナ参照)
+  #
+  # 偽装しているのは「SSM から取得して環境変数へ入れる」「環境変数を
+  # /etc/cwagentconfig へ流し込む」ところまでで、**設定のマージと解釈は実エージェントが
+  # そのまま行う**。したがってローカルで成立した JSON は、そのまま Parameter Store に
+  # 登録すれば ECS でも同じ実効設定になる。
+  #
+  # 通常の `docker compose up` では起動しない (profiles)。使い方:
+  #   docker compose --profile ssm-config up -d cwagent-ssm
+  #   ./verify-cwagent-ssm.sh
+  #
+  # 既存の cwagent とは送信先ロググループ名を変えてある (/local/myapp/ssm/*) ため、
+  # cloudwatch-logs-mock の request journal でどちらの経路の送信か区別できる。
+  # 詳細は docs/CWAGENT-SSM-CONFIG.md を参照。
+  # ===========================================================================
+  cwagent-ssm:
+    image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
+    container_name: cwagent-ssm
+    profiles: ["ssm-config"]
+    # entrypoint  … SSM 注入の偽装 (環境変数 → /etc/cwagentconfig への materialize)
+    # command     … 既存の自己診断ラッパー → エージェント本体、の順に引き渡す
+    entrypoint: ["/bin/sh", "/opt/cwagent-ssm/ssm-config-entrypoint.sh"]
+    command:
+      - "/bin/sh"
+      - "/opt/cwagent-verify/verify-mount.sh"
+      - "/opt/aws/amazon-cloudwatch-agent/bin/start-amazon-cloudwatch-agent"
+    environment:
+      AWS_REGION: ap-northeast-1
+      # --- SSM Parameter Store 注入の偽装 (ssm-config-entrypoint.sh) ----------
+      # 「環境変数名=パラメータ名」の空白区切り。並び順がそのままマージ順になる。
+      # 値は ./compose/cwagent/ssm/<パラメータ名の最後の要素>.json から読む。
+      # ECS の secrets 相当を環境変数で直接与えたい場合は、下の environment に
+      # CW_CONFIG_CONTENT: '{"agent":...}' のように JSON を直書きすればそちらが優先される。
+      CWA_SSM_PARAMS: "CW_CONFIG_CONTENT=/myapp/local/cwagent-config CW_CONFIG_CONTENT_MID=/myapp/local/cwagent-config-mid"
+      CWA_SSM_VALUE_DIR: /opt/cwagent-ssm/params
+      CWA_SSM_CONFIG_DIR: /etc/cwagentconfig
+      # materialize 後に環境変数を落とす (実エージェント側の CW_CONFIG_CONTENT
+      # 自動ロードと二重に読まれるのを防ぐ)。ECS と同じ「環境変数が残った状態」で
+      # 検証したい場合は 0 にする
+      CWA_SSM_UNSET_AFTER: "1"
+      # --- 既存の自己診断ラッパー (verify-mount.sh) の設定 --------------------
+      CWA_VERIFY_MOUNTS: /mnt/logs
+      CWA_VERIFY_CONFIG_DIR: /etc/cwagentconfig
+      # マウントではなく materialize で作られるファイル名を主設定として見る
+      CWA_VERIFY_CONFIG_FILE: /etc/cwagentconfig/00-cwagent-config.json
+      CWA_VERIFY_EXPECT_OWNER: "6301:6302"
+      CWA_VERIFY_EXPECT_MODE: "775"
+      CWA_VERIFY_RECHECK_COUNT: "5"
+      CWA_VERIFY_RECHECK_INTERVAL: "20"
+      CWA_VERIFY_RELAY_AGENT_LOG: "1"
+    # /etc/cwagentconfig は **マウントしない** (設定は環境変数から materialize する)。
+    # ただしこのイメージには mkdir(1) が無い場合があるため、tmpfs でディレクトリの
+    # 存在だけ保証する。ECS では task volume + mountPoints が同じ役割を果たす。
+    tmpfs:
+      - /etc/cwagentconfig
+    volumes:
+      - ./compose/cwagent/ssm-config-entrypoint.sh:/opt/cwagent-ssm/ssm-config-entrypoint.sh:ro
+      # Parameter Store に登録する JSON の実体 (= パラメータの値そのもの)
+      - ./compose/cwagent/ssm:/opt/cwagent-ssm/params:ro
+      - ./compose/cwagent/aws-credentials:/root/.aws/credentials:ro
+      - ./compose/cwagent/verify-mount.sh:/opt/cwagent-verify/verify-mount.sh:ro
+      - efs-logs:/mnt/logs:ro
+    group_add:
+      - "6302"
+    depends_on:
+      efs-mock:
+        condition: service_healthy
+      cloudwatch-logs-mock:
+        condition: service_healthy
+    healthcheck:
+      # SSM 注入の偽装と、起動時の自己診断の両方が FAIL でなければ healthy。
+      # このイメージには ls/cat/grep が無いためシェル組み込み (read / test) だけで判定する。
+      test: ["CMD-SHELL", "read -r s < /tmp/cwagent-ssm.result && read -r v < /tmp/cwagent-verify.boot.result && [ \"$$s\" != FAIL ] && [ \"$$v\" != FAIL ]"]
       interval: 5s
       timeout: 3s
       retries: 12
