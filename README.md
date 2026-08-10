@@ -164,6 +164,27 @@ curl -s  http://localhost:8080/tls-probe/truststore | jq .
 
 ポート: secure-api `:8543` (HTTPS) / ALB HTTPS リスナー `:9443`
 
+### コンテナの中から対話的に確認する (証明書チェック)
+
+上記の `verify-tls.sh` / `tls-probe` はこのリポジトリ内で完結する検証だが、
+**front/back のコンテナ自身の `curl` で HTTPS 接続できるか**を対話的に確かめたい場合は、
+姉妹リポジトリ `Container_Compose_Build_Push_v2_from_Codex` の `build_and_verify.sh` にある
+**証明書チェック**を使う。`--keep-container-mode logs` の操作メニューに、ログ表示・bash 接続・
+healthcheck 調査と同じ並びで表示される。
+
+```bash
+cd ../Container_Compose_Build_Push_v2_from_Codex
+./build_and_verify.sh --compose-service app-front,app-back --keep-container-mode logs
+# → Compose サービスを選択 → 「証明書チェック」を選ぶ (追加の入力は不要)
+```
+
+トラストストア・パスワード・接続先・CA 証明書はすべてコンテナ内の JVM 引数と環境変数から
+自動検出するため、パラメータの指定はいらない。この構成の front/back なら
+**JDK 側と JBoss (Elytron) 側の両トラストストア × secure-api 直接と ALB 経由の両接続先**が
+自動で拾われ、接続先ごとの対照テスト (`--cacert` 無しでは失敗すること) まで 1 操作で回る。
+メニューはトラストストアと `https://` 環境変数の有無で出し分けられるため、
+`mysql` や `adot-collector` などでは表示されない。
+
 **実装・設定方法の詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) を参照。**
 
 ## EFS / CloudWatch Logs 転送の偽装

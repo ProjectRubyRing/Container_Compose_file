@@ -267,6 +267,37 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
 | `ERROR 3159 Connections using insecure transport are prohibited` | `require_secure_transport=ON` / RDS Proxy の "Require TLS" が有効。クライアント側で TLS を有効にする (想定どおりの挙動) |
 | `Public Key Retrieval is not allowed` | 平文接続で `caching_sha2_password` を使ったとき。TLS が張れていないので上記を先に解決する |
 
+### 自己証明書 HTTPS (secure-api / ALB) 関連
+
+`tls-probe` は **JVM から見た** 接続可否を返すため、失敗したとき
+「トラストストアに CA が入っていない」のか「そもそも宛先へ届いていない」のかの
+切り分けが要る。コンテナ内の `curl` から同じ経路をたどると早い。
+
+姉妹リポジトリの `Container_Compose_Build_Push_v2_from_Codex/build_and_verify.sh` を
+`--keep-container-mode logs` で起動すると、操作メニューに**証明書チェック**が出る
+(表示条件はコンテナ内に `curl` + `keytool` があり、JVM トラストストアと `https://`
+環境変数の両方を持つこと。app-front / app-back が該当し、mysql 等には出ない)。
+選択後の入力は不要で、次を自動検出して一度に回す。
+
+| 検出対象 | 検出元 |
+|---|---|
+| トラストストア | 起動中 JVM の `-Djavax.net.ssl.trustStore` → `*TRUSTSTORE*` 環境変数 (JDK 側と JBoss 側の両方) |
+| ↑の内訳 | JBoss 側は compose.yaml の `JBOSS_TRUSTSTORE_FILE` から。JDK 側は entrypoint が `JAVA_TOOL_OPTIONS` へ足すため `docker exec` の環境には出ず、`/proc/<pid>/environ` 経由で拾う |
+| パスワード | `-Djavax.net.ssl.trustStorePassword` → `*_PASSWORD` 環境変数 → `changeit` → 無し |
+| 接続先 | `https://` を値に持つ環境変数 (`SECURE_API_URL` / `SECURE_API_VIA_ALB_URL`) |
+| CA 証明書 | `${PKI_TRUST_DIR}/*.crt` |
+
+読み方は次のとおり。
+
+- **CA 証明書の SHA-256 照合が `[FAIL]`** → `cacert.crt` がそのストアに入っていない。
+  entrypoint の `keytool -importcert` が失敗している。表示される `keytool -importcert`
+  の実行例で手当てできる
+- **接続が `curl exit 60`** → ストアに CA が無い / サーバ証明書のチェーンが違う
+- **`curl exit 6` / `7`** → 名前解決・到達性の問題であってトラストストアは無関係。
+  compose ネットワークと `secure-api` の起動状態を見る
+- **対照テスト (`--cacert` 無し) が `[WARN]` で成功** → 宛先がパブリック CA でも検証できており、
+  自己証明書の取り込みを検証できていない。`cacert.crt` の配布経路を疑う
+
 ### SSM / タスク起動関連
 
 - `ResourceInitializationError: unable to pull secrets` → タスク実行ロールの
