@@ -729,6 +729,13 @@ services:
   # front/back のトラストストアへ入る cacert.crt は常に★受領物そのもの★。
   # 詳細は compose/pki/provided/README.md と docs/TLS-SELF-SIGNED-ALB.md を参照。
   #
+  # ★配備した cacert.crt はホストの compose/pki/export/ にも出力される (PKI_EXPORT_DIR)
+  #   named volume の中身は docker build から見えないため、ベースイメージ /
+  #   app-front / app-back のビルドへ build secret で渡すにはホスト側のファイルが要る。
+  #     ビルドへ渡す : docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+  #     受領物に固定 : ./pki-export.sh --to-provided
+  #                    (compose/pki/export/cacert.crt をそのまま provided/ へ置くのと同じ)
+  #
   # 配備は冪等 (入力が変わらなければ 2 回目以降は再利用)。強制的に作り直すには:
   #   docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot
   #   もしくは docker compose down -v で volume ごと削除
@@ -757,12 +764,29 @@ services:
       PKI_KEYSTORE_PASSWORD: changeit   # secure-api 用 PKCS#12 のパスワード (テスト用)
       PKI_CA_CN: Local Test Self-Signed CA   # 自動発行時の cacert.crt の CN
       PKI_FORCE_REGENERATE: "0"    # "1" で毎起動時に作り直す
+      # --- ★出力 (export) 先 (コンテナ内パス。固定値) ------------------------
+      # 配備した cacert.crt をホストへも書き出す。named volume の中身は
+      # docker build から参照できないため、ビルドへ渡すにはホスト側のファイルが要る。
+      #   用途1: イメージビルドへ build secret として渡す
+      #          (compose.build-secret.yaml / docker build --secret id=cacert,src=...)
+      #   用途2: そのまま compose/pki/provided/ へ置いてこの CA を受領物として固定する
+      # 下の volumes の ${PKI_EXPORT_DIR} は .env で解決される★ホストパス★で別スコープ。
+      PKI_EXPORT_DIR: /export
+      # 秘密鍵 (cacert.key) も出力するか。1 = 出力する (既定)。
+      # 出力物を provided/ へ置き直したときに「受領 CA がサーバ証明書も発行する」
+      # パターン A を維持できる。鍵を持ち出したくない場合は 0。
+      PKI_EXPORT_KEY: ${PKI_EXPORT_KEY:-1}
     volumes:
       - pki:/pki
       # 受領済み自己証明書の投入口 (読み取り専用)。既定は repo 内の
       # compose/pki/provided/。共有フォルダ等に置きたい場合は .env で
       # PKI_PROVIDED_DIR=/path/to/dir を指定するとその場所を mount する。
       - ${PKI_PROVIDED_DIR:-./compose/pki/provided}:/provided:ro
+      # ★出力口 (読み書き)。pki-init がここへ cacert.crt / cacert.key /
+      # verify-bundle.crt / trust/*.crt / MANIFEST.txt を書き出す。
+      # ベースイメージのビルドコンテキスト上の「所定のディレクトリ」を直接
+      # 出力先にしたい場合は .env で PKI_EXPORT_DIR=/path/to/build-context/secrets を指定する。
+      - ${PKI_EXPORT_DIR:-./compose/pki/export}:/export
     healthcheck:
       # 配備完了マーカーと、各コンテナが実際に参照するファイルの存在を確認する。
       # trust/cacert.crt は front/back が JDK / JBoss 両ストアへ取り込む本命 (受領物)。

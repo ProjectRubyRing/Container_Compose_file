@@ -38,6 +38,20 @@ docker compose logs pki-init           # ★どのモードで動いたかを必
 PKI_PROVIDED_DIR=/c/secure/certs/received
 ```
 
+### `pki-init` が発行した CA をここへ置いて固定する
+
+受領物が無い場合 `pki-init` は自己署名 CA を自動発行しますが、その `cacert.crt` は
+ホストの [`../export/`](../export/README.md) にも出力されます。
+**出力された `cacert.crt` はそのままこのディレクトリへ置けます** (変換・リネーム不要)。
+置くと次回以降 `provided` モードになり、同じ CA を使い続けられます。
+
+```bash
+./pki-export.sh --to-provided        # export/ の cacert.crt (+key) をここへ配置
+docker compose restart pki-init secure-api alb mysql app-front app-back
+```
+
+`cacert.key` も一緒に置けば下表の (A)、`cacert.crt` だけなら (B) になります。
+
 ---
 
 ## 2. 受領物に秘密鍵があるかどうかで挙動が変わる
@@ -105,5 +119,19 @@ PKIX エラーで失敗しますが、それが**期待値**です
 | `PKI_PROVIDED_DIR` | `./compose/pki/provided` | 受領物の置き場 (ホストパス) |
 | `PKI_MODE` | `auto` | `auto` = `cacert.crt` があれば使う / `provided` = 必須 (無ければ起動失敗) / `generate` = 受領物を無視して自動発行 |
 | `PKI_TRUST_LOCAL_CA` | `1` | 鍵なし時に `local-test-ca` をトラストストアへ入れるか |
+| `PKI_EXPORT_DIR` | `./compose/pki/export` | 配備した `cacert.crt` の**出力先**。ここへ出たものをこのディレクトリへ置き直せる |
+
+---
+
+## 5. 関連: 出力側 (`../export/`)
+
+| | `provided/` (このディレクトリ) | [`export/`](../export/README.md) |
+|---|---|---|
+| 向き | **入力** — 受領した `cacert.crt` を投入する | **出力** — 配備した `cacert.crt` を書き出す |
+| 誰が置く / 書く | 人 (受領物をコピー) | `pki-init` が自動 |
+| 主な使い道 | この CA をトラストアンカーにする | イメージのビルドへ build secret で渡す / `provided/` へ置き直す |
+
+出力された `cacert.crt` を `provided/` へ置く往復ができるので、
+「自動発行 → その CA を固定 → ビルドへ焼き込む」という流れがそのまま回ります。
 
 詳細は [`docs/TLS-SELF-SIGNED-ALB.md`](../../../docs/TLS-SELF-SIGNED-ALB.md) を参照。

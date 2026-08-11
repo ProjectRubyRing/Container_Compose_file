@@ -6,12 +6,15 @@ ECS/Fargate 本番構成と、AWS に接続せずローカル完結で等価検�
 
 ```
 compose.yaml                         # ローカル検証用 compose (Jaeger を X-Ray の代替 UI に)
+compose.build-secret.yaml            # ★オーバーレイ: cacert.crt を build secret で front/back のビルドへ渡す
 DESIGN.md                            # 設計判断の根拠・デプロイ手順・トラブルシューティング
 docs/ASYNC-SQS-LAMBDA-ALB.md         # 非同期チェーン (SQS→Lambda→ALB→app-back) 詳細ガイド
 docs/CWAGENT-SSM-CONFIG.md           # CW_CONFIG_CONTENT / CW_CONFIG_CONTENT_MID による設定注入の詳細ガイド
 docs/MYSQL-8.4-AURORA-UPGRADE.md     # Aurora 8.4 / MySQL 8.4.7 化・Connector/J 9.7.0 の詳細解説
 docs/RDS-PROXY-TLS.md                # DB の TLS を RDS Proxy 相当にそろえる設定 / MY-010068 の読み方
 docs/TLS-SELF-SIGNED-ALB.md          # 自己署名証明書 HTTPS / JVM トラストストア / ALB 証明書の詳細ガイド
+docs/PKI-CACERT-EXPORT.xlsx          # ★cacert.crt の配備→出力→build secret→取り込み の一覧表 (Excel 8 シート)
+docs/tools/gen-pki-cacert-xlsx.py    #   ↑の生成スクリプト (内容を直すときはこちらを編集して再生成)
 .env.example                         # compose 用環境変数の雛形 (→ .env にコピー)
 verify-local.sh                      # ローカル動作確認スクリプト
 verify-async.sh                      # 非同期チェーンの動作確認スクリプト
@@ -19,6 +22,7 @@ verify-tls.sh                        # 自己署名証明書 HTTPS 経路の動�
 verify-cwagent-ssm.sh                # cwagent の SSM (SecureString) 設定注入の動作確認スクリプト
 alb-maintenance.sh                   # ALB 全面メンテナンスモードの ON/OFF 切り替え
 alb-tls-cert.sh                      # ALB HTTPS リスナーの証明書切り替え (自己署名 / 中間CA発行)
+pki-export.sh                        # ★配備した cacert.crt の取り出しと配置 (build secret 用 / provided へ固定)
 compose/
   otel/adot-collector-local.yaml     # ADOT Collector ローカル設定 (debug + Jaeger 出力)
   mysql/init.sql                     # appdb: XA_RECOVER_ADMIN 付与ほか初期化
@@ -38,6 +42,8 @@ compose/
   alb/rules-tls/                     # HTTPS リスナーのルール (★差し替え可能★)
   alb/tls/                           # HTTPS リスナーに適用する証明書 (★差し替え可能★, variants/ あり)
   pki/gen-certs.sh, Dockerfile       # 自己署名 PKI 発行 (ルートCA→中間CA→サーバ証明書 / secure-api・ALB・MySQL)
+  pki/provided/                      # ★受領した cacert.crt の投入口 (置くと provided モード。git 管理外)
+  pki/export/                        # ★配備した cacert.crt の出力口 (build secret の入力 / provided への配置元。git 管理外)
   secure-api/mappings/               # HTTPS 専用 REST API (WireMock) のスタブ
   tls-verifier/verify-tls.sh, Dockerfile # TLS 経路の検証コンテナ (compose ネットワーク内から実行)
   maintenance-lambda/app/maintenance.py  # メンテナンス画面 Lambda (★差し替え可能★, 画面HTML+503)
@@ -163,6 +169,57 @@ curl -s  http://localhost:8080/tls-probe/truststore | jq .
 **両パターンを同時に検証できる**よう、ALB 用に自己署名リーフと `cacert.crt` 発行の 2 種類を発行している。
 
 ポート: secure-api `:8543` (HTTPS) / ALB HTTPS リスナー `:9443`
+
+### ★配備した cacert.crt をイメージのビルドへ渡す (export → build secret)
+
+`pki-init` が配備した `cacert.crt` は named volume だけでなく
+**ホストの `compose/pki/export/` へも自動で出力される**。
+`docker build` はビルドコンテキスト (ホスト上のファイル) しか読めないため、
+**イメージのビルドへ証明書を渡すにはホスト側のファイルが要る**からである。
+
+社内標準ベースイメージは BuildKit の **build secret** 経由で
+「ビルドコンテキスト上の所定のディレクトリに置いた `cacert.crt`」を受け取り、
+JVM のトラストストアと JBoss EAP (Elytron) のトラストストアへ取り込んでいる。
+出力される `cacert.crt` は **PEM 1 枚**なので、その入力にそのまま使える。
+
+```bash
+docker compose up -d pki-init          # compose/pki/export/cacert.crt が出力される
+ls compose/pki/export/                 # cacert.crt / cacert.key / verify-bundle.crt / trust/ / MANIFEST.txt
+
+# 1) イメージのビルドへ build secret で渡す (ベースイメージと同じ方式)
+docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+docker compose -f compose.yaml -f compose.build-secret.yaml up -d
+docker compose logs app-front | grep 'truststore\[build\]'      # 取り込み記録
+
+# 素の docker build で渡す場合
+docker build --secret id=cacert,src=compose/pki/export/cacert.crt -f front/Dockerfile ./docker
+
+# 2) そのまま compose/pki/provided/ へ置いて、この CA を「受領物」として固定する
+./pki-export.sh --to-provided
+docker compose restart pki-init secure-api alb mysql app-front app-back
+
+# ベースイメージのビルドコンテキスト上の所定ディレクトリへ配置する
+./pki-export.sh --to ../base-image/secrets
+```
+
+- **出力された `cacert.crt` は `compose/pki/provided/` へコピーするだけでそのまま使える**
+  (形式変換・リネーム不要)。`cacert.key` も一緒に置けば「受領 CA が全サーバ証明書を発行する」
+  構成のまま固定できる
+- `docker/front/Dockerfile` / `docker/back/Dockerfile` にも
+  `RUN --mount=type=secret,id=cacert` による取り込みを実装済み。**secret を渡さなければ
+  何もしない**ため、従来どおりの `docker compose up -d --build` は影響を受けない
+- ビルド時取り込みと entrypoint の実行時取り込みは併用できる。`PKI_TRUST_DIR` に
+  証明書が無ければ実行時取り込みはスキップされ、**イメージへ焼き込んだトラストストアが
+  そのまま使われる** (= `pki` volume 無しでも HTTPS が通る)
+- `--mount=type=secret` はビルド中だけ tmpfs にマウントされ、**イメージのレイヤーにも
+  ビルドキャッシュにも残らない**
+- 出力先は `.env` の `PKI_EXPORT_DIR` で変更できる (ビルドコンテキスト配下を直接指定してもよい)。
+  秘密鍵を出したくない場合は `PKI_EXPORT_KEY=0`
+
+一覧表 (出力ファイル / 環境変数 / 手順 / ビルド時と実行時の違い / トラブル対応) は
+**[docs/PKI-CACERT-EXPORT.xlsx](docs/PKI-CACERT-EXPORT.xlsx)** (Excel, 8 シート) にまとめてある。
+内容を直す場合は `docs/tools/gen-pki-cacert-xlsx.py` を編集して再生成すること
+(`python docs/tools/gen-pki-cacert-xlsx.py`)。
 
 ### コンテナの中から対話的に確認する (証明書チェック)
 

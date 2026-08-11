@@ -84,6 +84,19 @@
 #                                 受領した cacert.crt を差し替えると値が変わるため、
 #                                 PKI_FORCE_REGENERATE を付けなくても自動で作り直す
 #
+# 【★出力 (export)】(${PKI_EXPORT_DIR}, 既定 /export = ホストの compose/pki/export/)
+#   named volume の中身は他イメージのビルドからは見えないため、配備した cacert.crt を
+#   ホスト側へも書き出す。用途は 2 つ (詳細はスクリプト後半の 5 章)。
+#     (1) ベースイメージ / front / back のビルドへ build secret として渡す
+#         (--mount=type=secret,id=cacert で取り込む方式の入力ファイルになる)
+#     (2) そのまま compose/pki/provided/ へ置いて、その CA を受領物として固定する
+#   出力物:
+#     cacert.crt        ★これ 1 枚。provided/ へコピーしても build secret に渡してもよい
+#     cacert.key        秘密鍵がある場合のみ (PKI_EXPORT_KEY=0 で抑止できる)
+#     verify-bundle.crt サーバ証明書検証用 CA バンドル (curl --cacert 等で使う)
+#     trust/*.crt       front/back のトラストストアへ入れる証明書一式
+#     MANIFEST.txt      いつ / どのモードで / どの指紋の証明書を出したかの記録
+#
 # 注意: テスト環境専用のため秘密鍵はパスフレーズ無し・mode 0644 で配置する
 #       (コンテナごとに実行ユーザが違うため。本番でこの構成にしないこと)。
 # =============================================================================
@@ -93,6 +106,13 @@ PKI_ROOT="${PKI_ROOT:-/pki}"
 # 受領済み自己証明書の投入口 (compose が bind mount する。既定はホストの
 # compose/pki/provided/。.env の PKI_PROVIDED_DIR で任意のホストパスへ変更可)
 PROVIDED_DIR="${PKI_PROVIDED_DIR:-/provided}"
+# ★出力口 (compose が読み書き可で bind mount する。既定はホストの compose/pki/export/)。
+# ここへ書いたファイルはホストから直接参照できるため、build secret の入力にも
+# compose/pki/provided/ へのコピー元にもそのまま使える。マウントが無ければ出力しない。
+EXPORT_DIR="${PKI_EXPORT_DIR:-/export}"
+# 秘密鍵 (cacert.key) も出力するか。1 (既定) にしておくと、出力物を provided/ へ
+# 置き直したときに「受領 CA がサーバ証明書も発行する」構成 (パターン A) を維持できる
+EXPORT_KEY="${PKI_EXPORT_KEY:-1}"
 # auto     … provided/cacert.crt があれば provided、無ければ generate
 # provided … 受領物必須 (無ければ起動失敗させる)
 # generate … 従来どおり全部自動発行 (受領物があっても無視する)
@@ -566,7 +586,120 @@ fi
 log "================================================================"
 
 # =============================================================================
-# 5. 終了方法
+# 5. 出力 (export) — 他イメージのビルドや他環境へ持ち出すための cacert.crt
+# ---------------------------------------------------------------------------
+# 配備先の named volume (pki) はコンテナ実行時にしか見えず、docker build からは
+# 参照できない。そこで ${EXPORT_DIR} (compose がホストの compose/pki/export/ を
+# 読み書き可で bind mount する) へ同じ cacert.crt を書き出しておく。用途は 2 つ。
+#
+#  (1) ★イメージのビルドへ build secret として渡す
+#      社内標準ベースイメージは
+#        RUN --mount=type=secret,id=cacert,target=/run/secrets/cacert.crt ...
+#      の形で「ビルドコンテキスト上の所定のディレクトリに置いた cacert.crt」を
+#      受け取り、JDK の cacerts と JBoss (Elytron) のトラストストアへ取り込む。
+#      ここで出力する cacert.crt は PEM 1 枚なので、その入力にそのまま使える。
+#        docker build --secret id=cacert,src=compose/pki/export/cacert.crt ...
+#        docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+#      (docker/front/Dockerfile, docker/back/Dockerfile にも同じ取り込みを実装済み)
+#
+#  (2) ★compose/pki/provided/ へそのまま置いて、この CA を受領物として固定する
+#      cp compose/pki/export/cacert.crt compose/pki/provided/cacert.crt
+#      次回以降 pki-init は provided モードになり、同じ CA を使い続ける。
+#      cacert.key も一緒に置けば「受領 CA が全サーバ証明書を発行する」構成
+#      (パターン A) のままになる。./pki-export.sh --to-provided がこの
+#      コピーを代行する。
+#
+# 注意: 出力するのは「検証に成功した配備結果」だけ。上の 4 章で失敗した場合は
+#       ここまで到達しないため、壊れた PKI が持ち出されることはない。
+# =============================================================================
+export_artifacts() {
+  if [ ! -d "${EXPORT_DIR}" ]; then
+    log "export: ${EXPORT_DIR} が無いため出力しません"
+    log "  (compose.yaml の pki-init に volumes: \${PKI_EXPORT_DIR:-./compose/pki/export}:/export があるか確認)"
+    return 0
+  fi
+  if ! ( : > "${EXPORT_DIR}/.write-test" ) 2>/dev/null; then
+    log "WARN: export: ${EXPORT_DIR} へ書き込めません (read-only でマウントされていませんか)"
+    return 0
+  fi
+  rm -f "${EXPORT_DIR}/.write-test"
+
+  mkdir -p "${EXPORT_DIR}/trust"
+
+  # 前回の出力が残っていると、モードを切り替えたときに古い成果物を掴む。特に
+  # cacert.key は「provided モードで鍵があるか」の判定そのものを変えてしまい、
+  # 鍵と証明書の不一致 (= pki-init の起動失敗) を招く。毎回まるごと消してから書く。
+  rm -f "${EXPORT_DIR}/cacert.crt" "${EXPORT_DIR}/cacert.key" \
+        "${EXPORT_DIR}/verify-bundle.crt" "${EXPORT_DIR}/MANIFEST.txt" \
+        "${EXPORT_DIR}/trust"/*.crt
+
+  cp "${CACERT}"        "${EXPORT_DIR}/cacert.crt"
+  cp "${VERIFY_BUNDLE}" "${EXPORT_DIR}/verify-bundle.crt"
+  for _f in "${PKI_ROOT}/trust"/*.crt; do
+    [ -f "${_f}" ] || continue
+    cp "${_f}" "${EXPORT_DIR}/trust/$(basename "${_f}")"
+  done
+
+  EXPORT_KEY_STATE="秘密鍵なし (この出力物を provided/ へ置くとパターン B = local-test-ca 発行になる)"
+  if [ -f "${CAKEY}" ]; then
+    if [ "${EXPORT_KEY}" = "1" ]; then
+      cp "${CAKEY}" "${EXPORT_DIR}/cacert.key"
+      chmod 0600 "${EXPORT_DIR}/cacert.key" 2>/dev/null || true
+      EXPORT_KEY_STATE="cacert.key も出力済み (provided/ へ両方置けばパターン A を維持)"
+    else
+      EXPORT_KEY_STATE="秘密鍵はあるが PKI_EXPORT_KEY=0 のため出力しない"
+    fi
+  fi
+
+  # 出力物の素性を残す。ビルドに渡した証明書と、front/back のトラストストアに
+  # 入っている証明書が同じものかを SHA-256 で突き合わせるための記録でもある。
+  {
+    echo "# pki-init export manifest (テスト環境専用)"
+    echo "generated-at : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "pki-mode     : ${MODE}"
+    echo "key          : ${EXPORT_KEY_STATE}"
+    echo ""
+    echo "[cacert.crt] ★これが唯一のトラストアンカー"
+    echo "  subject    : $(openssl x509 -in "${EXPORT_DIR}/cacert.crt" -noout -subject | sed 's/^subject=//')"
+    echo "  issuer     : $(openssl x509 -in "${EXPORT_DIR}/cacert.crt" -noout -issuer  | sed 's/^issuer=//')"
+    echo "  notBefore  : $(openssl x509 -in "${EXPORT_DIR}/cacert.crt" -noout -startdate | sed 's/^notBefore=//')"
+    echo "  notAfter   : $(openssl x509 -in "${EXPORT_DIR}/cacert.crt" -noout -enddate   | sed 's/^notAfter=//')"
+    echo "  SHA-256 FP : $(fingerprint "${EXPORT_DIR}/cacert.crt")"
+    echo ""
+    echo "[files] sha256sum"
+    ( cd "${EXPORT_DIR}" && find . -type f ! -name MANIFEST.txt -exec sha256sum {} + | sort -k2 )
+    echo ""
+    echo "[使い方 1] イメージのビルドへ build secret として渡す"
+    echo "  docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back"
+    echo "  docker build --secret id=cacert,src=compose/pki/export/cacert.crt -f front/Dockerfile ./docker"
+    echo "  (Dockerfile 側: RUN --mount=type=secret,id=cacert,target=/run/secrets/cacert.crt ...)"
+    echo ""
+    echo "[使い方 2] この CA を受領物として固定する"
+    echo "  cp compose/pki/export/cacert.crt compose/pki/provided/cacert.crt"
+    echo "  cp compose/pki/export/cacert.key compose/pki/provided/cacert.key   # 鍵も出ていれば"
+    echo "  docker compose restart pki-init secure-api alb mysql app-front app-back"
+    echo "  (./pki-export.sh --to-provided が上記を代行する)"
+    echo ""
+    echo "[注意] cacert.key は CA の秘密鍵。持っている人は任意のサーバ証明書を発行できる。"
+    echo "       テスト環境専用。コミット / 共有しないこと (compose/pki/export/ は .gitignore 済み)。"
+  } > "${EXPORT_DIR}/MANIFEST.txt"
+
+  chmod 0644 "${EXPORT_DIR}/cacert.crt" "${EXPORT_DIR}/verify-bundle.crt" \
+             "${EXPORT_DIR}/MANIFEST.txt" 2>/dev/null || true
+
+  log "★export: cacert.crt を ${EXPORT_DIR} へ出力しました (ホストの compose/pki/export/)"
+  log "    SHA-256 FP : $(fingerprint "${EXPORT_DIR}/cacert.crt")"
+  log "    key        : ${EXPORT_KEY_STATE}"
+  log "    同梱        : verify-bundle.crt / trust/*.crt / MANIFEST.txt"
+  log "    ビルドへ渡す: docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back"
+  log "    固定して使う: cp compose/pki/export/cacert.crt compose/pki/provided/cacert.crt"
+  log "                  (もしくは ./pki-export.sh --to-provided)"
+}
+
+export_artifacts
+
+# =============================================================================
+# 6. 終了方法
 # =============================================================================
 # 既定: 常駐する。compose の depends_on: service_healthy で待たせるには
 #       コンテナが running のままである必要があるため。

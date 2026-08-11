@@ -76,6 +76,9 @@ JVM_TRUSTSTORE_PASSWORD="${JVM_TRUSTSTORE_PASSWORD:-changeit}"
 JBOSS_TRUSTSTORE_FILE="${JBOSS_TRUSTSTORE_FILE:-${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12}"
 JBOSS_TRUSTSTORE_PASSWORD="${JBOSS_TRUSTSTORE_PASSWORD:-changeit}"
 TRUSTSTORE_IMPORT_REQUIRED="${TRUSTSTORE_IMPORT_REQUIRED:-false}"
+# ビルド時に build secret (id=cacert) で取り込んだ記録。Dockerfile が書き出す。
+# 実行時の取り込みと区別してログに出すためだけに参照する
+CACERT_BUILD_MARKER="${CACERT_BUILD_MARKER:-/opt/pki/build-import.txt}"
 
 find_source_cacerts() {
   local java_bin candidates=()
@@ -119,8 +122,20 @@ import_certs_into() {
 import_trusted_certs() {
   local src dst imported=0
 
+  # ビルド時に build secret (id=cacert) で取り込み済みなら、その記録を表示する。
+  # 記録があれば JDK 同梱 cacerts と jboss-truststore.p12 に焼き込み済みという意味
+  if [[ -f "${CACERT_BUILD_MARKER}" ]]; then
+    log "truststore[build]: ビルド時に cacert.crt を取り込み済み (build secret 経由)"
+    while IFS= read -r line; do log "truststore[build]:   ${line}"; done < "${CACERT_BUILD_MARKER}"
+  fi
+
+  # ここで return するため、ビルド時に焼き込んだトラストストアは温存される
+  # (この下の JBoss 側ストア再生成は「実行時に配る証明書がある」ときだけ走る)
   if [[ ! -d "${PKI_TRUST_DIR}" ]] || ! compgen -G "${PKI_TRUST_DIR}/*.crt" >/dev/null; then
     log "truststore: ${PKI_TRUST_DIR} に *.crt が無いため取り込みをスキップします"
+    if [[ -f "${CACERT_BUILD_MARKER}" ]]; then
+      log "truststore: ビルド時取り込み済みのトラストストアをそのまま使用します"
+    fi
     return 0
   fi
 

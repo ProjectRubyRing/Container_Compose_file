@@ -41,6 +41,7 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 | cwagent の設定注入 (SSM SecureString → `CW_CONFIG_CONTENT` / `CW_CONFIG_CONTENT_MID`) | cwagent-ssm (同一イメージ, `profiles: ssm-config`) | 「SSM 取得 + KMS 復号」と「環境変数 → `/etc/cwagentconfig` への materialize」だけを偽装し、**設定のマージと解釈は実エージェントに行わせる**。詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md) |
 | CloudWatch Logs | WireMock (cloudwatch-logs-mock) | PutLogEvents 受信スタブ。request journal で送信内容を確認 |
 | AWS Private CA (ACM PCA) / 社内 CA | pki-init (openssl) | 自己証明書 `cacert.crt` → 各サーバ証明書を named volume で共有。トラストアンカーは `cacert.crt` 1 枚。**`compose/pki/provided/cacert.crt` に受領済みの証明書を置けばそれをそのまま使う** (無ければ自己署名 CA を自動発行)。鍵なしの受領物では発行専用の `local-test-ca` を併用する |
+| CA 証明書の配布 (S3 / Secrets Manager / 社内配布サーバ → CI がビルド前に取得) | pki-init が `compose/pki/export/` へ**出力** | named volume は `docker build` から見えないため、`cacert.crt` をホストへも書き出す。ベースイメージと同じ **build secret** (`--mount=type=secret,id=cacert`) でビルドへ渡せるほか、そのまま `compose/pki/provided/` へ置いて CA を固定できる。詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) 3 章 |
 | 自己証明書で HTTPS を要求する外部 API | WireMock (secure-api, `--disable-http`) | HTTPS のみ listen。★接続確認用のテスト接続先。front/back は `cacert.crt` を **JDK と JBoss(Elytron) の両トラストストア**へ取り込んで呼び出す。詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) |
 | ALB の HTTPS リスナー + ACM 証明書 | alb (nginx) の `listen 443 ssl` | 証明書は自己署名リーフ / `cacert.crt` 発行を `./alb-tls-cert.sh` で切り替え。`/secure/*` はターゲットへ HTTPS 再暗号化 |
 
@@ -160,6 +161,41 @@ Collector と同じ考え方で、CW Agent 設定もタスク定義の `secrets`
   既存の `cwagent` (ファイルマウント方式) は変更していないので、両方式を並べて比較できる。
 
 詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md)。
+
+### 2.8 自己証明書 (cacert.crt) はホストへ出力し、build secret でイメージへ渡す
+
+`pki-init` が配備した `cacert.crt` は named volume (`pki`) に置かれるが、
+**named volume の中身は `docker build` からは見えない**。
+一方、社内標準ベースイメージは BuildKit の build secret 経由で
+「ビルドコンテキスト上の所定のディレクトリに置いた `cacert.crt`」を受け取り、
+JVM と JBoss EAP のトラストストアへ取り込む作りになっている。
+この 2 つを繋ぐため、`pki-init` は同じ `cacert.crt` を
+**ホストの `compose/pki/export/` へも書き出す**。
+
+- **出力は PEM 1 枚をそのまま**。中身の書き換えもリネームもしないので、
+  **`compose/pki/provided/` へコピーするだけでそのまま入力として使える**
+  (自動発行した CA を「受領物」として固定できる = 入力と出力が往復する)。
+  `cacert.key` も出力するのは、置き直したときに「受領 CA が全サーバ証明書を発行する」
+  構成を維持するため (`PKI_EXPORT_KEY=0` で抑止できる)。
+- **出力は毎回まるごと作り直す**。特に `cacert.key` は `provided` モードの分岐そのものを
+  変えるため、古い鍵が残って証明書と食い違う (= `pki-init` の起動失敗) 事故を防ぐ。
+- **ビルドへの受け渡しは `COPY` ではなく `--mount=type=secret`**。ビルド中だけ tmpfs に
+  マウントされ、イメージのレイヤーにもビルドキャッシュにも残らない。
+  ベースイメージが採っている方式と同じにすることで、ローカルで検証した手順が
+  そのままベースイメージのビルドにも通用する。
+- **`compose.build-secret.yaml` に分離した理由**: compose の `secrets(file:)` は
+  参照先ファイルが無いと `build` が失敗する。`cacert.crt` は `pki-init` を起動して
+  初めて出力されるため、本体の `compose.yaml` に入れるとまっさらな clone での
+  `docker compose up -d --build` が通らなくなる。
+- **Dockerfile 側は secret が無ければ何もしない**ため、この追加で既存のビルド手順は
+  一切壊れない。ビルド時取り込みと entrypoint の実行時取り込みは併用でき、
+  `PKI_TRUST_DIR` に証明書が無ければ実行時取り込みはスキップされて
+  **イメージへ焼き込んだトラストストアがそのまま使われる**
+  (= `pki` volume 無しでも HTTPS が通る。ECS で volume を持たない構成に近い)。
+
+詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) 3 章 /
+[compose/pki/export/README.md](compose/pki/export/README.md)。
+一覧表は [docs/PKI-CACERT-EXPORT.xlsx](docs/PKI-CACERT-EXPORT.xlsx) (Excel, 8 シート)。
 
 ---
 
@@ -297,6 +333,16 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
   compose ネットワークと `secure-api` の起動状態を見る
 - **対照テスト (`--cacert` 無し) が `[WARN]` で成功** → 宛先がパブリック CA でも検証できており、
   自己証明書の取り込みを検証できていない。`cacert.crt` の配布経路を疑う
+
+### cacert.crt の出力 (export) / build secret 関連
+
+| 症状 | 原因と対処 |
+|---|---|
+| `compose/pki/export/` に何も出ない | `docker compose logs pki-init \| grep export:` を確認。`/export が無いため出力しません` なら bind mount が無い (compose.yaml の `${PKI_EXPORT_DIR:-./compose/pki/export}:/export`)。`./pki-export.sh` でコンテナから直接取り出すこともできる |
+| `docker compose build` が `secret ... no such file or directory` | `compose/pki/export/cacert.crt` が未出力。先に `docker compose up -d pki-init`。このエラーは `-f compose.build-secret.yaml` を付けたときだけ起きる |
+| ビルドログに `[build][cacert] ... スキップします` | secret が届いていない。`-f compose.build-secret.yaml` の指定、`docker build` なら `--secret id=cacert,src=...` の `id`、BuildKit の有効化 (`DOCKER_BUILDKIT=1`) を確認 |
+| 出力物を `provided/` へ置いたら `cacert.key は cacert.crt の秘密鍵ではありません` で pki-init が落ちる | 配置先に古い `cacert.key` が残っている。消してから置き直す (`./pki-export.sh --to-provided` は自動で消す) |
+| ビルド時に焼き込んだ証明書と実行時の中身が違う | `PKI_TRUST_DIR` に `*.crt` があると JBoss 側ストアは毎起動で作り直される。`docker compose logs app-front \| grep truststore` で `[build]` と `[jboss]` の両方を確認する |
 
 ### SSM / タスク起動関連
 

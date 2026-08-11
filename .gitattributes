@@ -36,3 +36,4 @@ Dockerfile  text eol=lf
 *.jar       binary
 *.p12       binary
 *.jks       binary
+*.xlsx      binary

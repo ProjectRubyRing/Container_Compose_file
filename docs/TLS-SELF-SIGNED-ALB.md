@@ -26,19 +26,42 @@ JDK 同梱 `cacerts` と JBoss のトラストストアへインポートする�
 > 置き場を repo 外にしたい場合は `.env` の `PKI_PROVIDED_DIR` でホストパスを指定する。
 > 詳細は [`compose/pki/provided/README.md`](../compose/pki/provided/README.md) と本書 2 章。
 
+> ## ★配備した `cacert.crt` をイメージのビルドへ渡す (export → build secret)
+>
+> `pki-init` が配備した `cacert.crt` は **ホストの `compose/pki/export/` へ自動で出力される**。
+> ベースイメージが行っているのと同じ **build secret** 方式でイメージへ焼き込めるほか、
+> **そのまま `compose/pki/provided/` へ置くだけ**でその CA を受領物として固定できる。
+>
+> ```bash
+> docker compose up -d pki-init                  # compose/pki/export/cacert.crt が出力される
+> docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+> docker compose -f compose.yaml -f compose.build-secret.yaml up -d
+> docker compose logs app-front | grep 'truststore\[build\]'
+>
+> ./pki-export.sh --to-provided                  # この CA を受領物として固定する
+> ./pki-export.sh --to ../base-image/secrets     # ベースイメージのビルドコンテキストへ配置
+> ```
+>
+> 詳細は [`compose/pki/export/README.md`](../compose/pki/export/README.md) と本書 3 章。
+
 ---
 
 ## 1. 全体像
 
 ```
       compose/pki/provided/cacert.crt   ← ★受領済み自己証明書 (置けば provided モード)
-                          │ bind mount (:ro)
-                          ▼
+                          │ bind mount (:ro)                    ▲
+                          ▼                                     │ cp / pki-export.sh --to-provided
                           ┌──────────────────────────────────────────┐
                           │ pki-init (openssl)                        │
                           │  cacert.crt (受領物 or 自動発行)          │
                           │    → 各サーバ証明書                       │
                           └──────────────┬───────────────────────────┘
+                                         │ bind mount (rw)
+                                         ├──▶ compose/pki/export/cacert.crt  ★ホストへ出力
+                                         │      └─▶ build secret (id=cacert)
+                                         │           └─▶ ベースイメージ / front / back の
+                                         │                ビルド時に keytool で焼き込む
                                          │ named volume: pki (読み取り専用で共有)
         ┌────────────────────────────────┼─────────────────────────────┐
         │                                │                             │
@@ -61,7 +84,7 @@ JDK 同梱 `cacerts` と JBoss のトラストストアへインポートする�
 
 | サービス | 役割 | ポート (ホスト:コンテナ) |
 |---|---|---|
-| `pki-init` | 自己証明書 `cacert.crt` (受領物 or 自動発行) と各サーバ証明書を named volume `pki` へ配置 | なし |
+| `pki-init` | 自己証明書 `cacert.crt` (受領物 or 自動発行) と各サーバ証明書を named volume `pki` へ配置。<br>あわせて `cacert.crt` をホストの `compose/pki/export/` へ**出力**する (ビルドへ渡す用) | なし |
 | `secure-api` | **HTTPS でのみ**待ち受ける REST API (WireMock)。★接続確認用のテスト接続先 | `8543:8443` |
 | `alb` | ALB 代替。HTTPS リスナーを追加 (証明書適用) | `9080:80` / **`9443:443`** |
 | `app-front` / `app-back` | `cacert.crt` を JDK / JBoss 両トラストストアへ取り込み、`tls-probe` から HTTPS 呼び出し | `8080` / `8180` |
@@ -151,6 +174,10 @@ HTTPS / MySQL / ALB といった他の検証項目はブロックされずに実
 
 `trust/` 配下のファイル名 (拡張子を除く) が、そのまま `keytool` の alias になる。
 
+上記は named volume (`pki`) の中身。**同じ `cacert.crt` はホストの
+`compose/pki/export/` にも書き出される**ので、イメージのビルドへ渡したり
+`compose/pki/provided/` へ置き直したりできる (3 章)。
+
 `ca/verify-bundle.crt` を参照するのは次の 3 か所。
 `cacert.crt` を直接指していないのは、鍵なし受領時に発行元が `local-test-ca` になるため。
 
@@ -210,11 +237,211 @@ SAN (subjectAltName) はコンテナ名で名前解決できるように設定�
 
 ---
 
-## 3. トラストストアへの取り込み (front / back)
+## 3. 配備した cacert.crt の出力 (export) と イメージビルドへの受け渡し (build secret)
+
+`pki-init` が配備した `cacert.crt` は、named volume だけでなく
+**ホストの `compose/pki/export/` にも自動で書き出される**。
+`docker compose up -d pki-init` するだけで出力されるので、追加の操作はいらない。
+
+### 3-1. なぜホストへ出力するのか
+
+証明書の実体は named volume (`pki`) にあり、**コンテナの実行時にしか見えない**。
+一方 `docker build` が読めるのは **ビルドコンテキスト (ホスト上のファイル)** だけなので、
+イメージのビルドへ証明書を渡すにはホスト側にファイルが必要になる。
+
+社内標準ベースイメージ (`EAP_BASE_IMAGE`) は、BuildKit の **build secret** 経由で
+「ビルドコンテキスト上の所定のディレクトリに置いた `cacert.crt`」を受け取り、
+JVM のトラストストア (JDK 同梱 `cacerts`) と JBoss EAP (Elytron) のトラストストアへ
+取り込んでいる。`compose/pki/export/cacert.crt` はその入力に**そのまま使える**
+PEM 1 枚 (中身の書き換えは一切していない)。
+
+```
+                pki-init (openssl)
+                  cacert.crt を発行 / 受領物をそのまま配備
+                        │
+        ┌───────────────┴────────────────┐
+        ▼                                ▼
+ named volume: pki                compose/pki/export/     ★ホスト側 (今回の追加)
+   実行時に front/back/mysql/         │
+   alb/secure-api が参照              ├──▶ build secret (id=cacert)
+        │                             │      └─▶ ベースイメージ / app-front / app-back の
+        │                             │           ビルド時に JDK cacerts + jboss-truststore.p12
+        ▼                             │           へ keytool で焼き込む
+ entrypoint.sh が起動時に             │
+ keytool で 2 ストアへ取り込む        └──▶ compose/pki/provided/ へコピー
+ (従来からの経路。そのまま残る)              └─▶ 次回以降その CA を「受領物」として固定
+```
+
+### 3-2. 出力されるファイル (`compose/pki/export/`)
+
+| ファイル | 内容 | 主な用途 |
+|---|---|---|
+| **`cacert.crt`** | ★唯一のトラストアンカー (受領物 or 自動発行) | **build secret の入力** / `provided/` へ置いて固定 |
+| `cacert.key` | その秘密鍵。存在する場合のみ (`PKI_EXPORT_KEY=0` で抑止) | `provided/` へ一緒に置くとパターン A を維持できる |
+| `verify-bundle.crt` | サーバ証明書を検証できる CA の集合 | `curl --cacert` などホストからの検証 |
+| `trust/*.crt` | front/back のトラストストアへ入る証明書一式 | 複数証明書をまとめて焼き込むビルドの入力 |
+| `MANIFEST.txt` | 出力日時 / モード / SHA-256 指紋 / 各ファイルの sha256 | ビルドへ渡した証明書の同一性確認 |
+
+出力は毎回まるごと作り直す。特に `cacert.key` は「鍵があるか」で `provided` モードの
+挙動が変わるため、古い鍵が残って証明書と食い違うことがないよう必ず消してから書く。
+
+`./pki-export.sh` はこの出力を**起動中の `pki-init` から取り出し直し**、
+さらに `provided/` やビルドコンテキストへ**配置**するためのヘルパー。
+
+```bash
+./pki-export.sh                        # 取り出して compose/pki/export/ へ (+内容表示)
+./pki-export.sh --show                 # 出力済みファイルの情報表示のみ
+./pki-export.sh --to-provided          # さらに compose/pki/provided/ へ配置 (CA を固定)
+./pki-export.sh --to ../base-image/secrets   # さらに任意のディレクトリへ配置
+./pki-export.sh --no-key               # 秘密鍵は取り出さない
+```
+
+### 3-3. 使い道 1 — build secret でイメージへ焼き込む ★ベースイメージと同じ方式
+
+```bash
+docker compose up -d pki-init          # cacert.crt が compose/pki/export/ に出る
+ls compose/pki/export/
+
+# app-front / app-back のビルドへ渡す (オーバーレイで build secret を配線)
+docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+docker compose -f compose.yaml -f compose.build-secret.yaml up -d
+
+# 素の docker build で渡す場合 (ベースイメージのビルドはこの形)
+docker build --secret id=cacert,src=compose/pki/export/cacert.crt \
+             --build-arg EAP_BASE_IMAGE=... -f front/Dockerfile ./docker
+```
+
+`docker/front/Dockerfile` / `docker/back/Dockerfile` に実装した取り込みは次のとおり
+(ベースイメージが行っているのと同じことを、このリポジトリ内で再現している)。
+
+```dockerfile
+RUN --mount=type=secret,id=cacert,target=/run/secrets/cacert.crt \
+    set -eu; \
+    if [ ! -s /run/secrets/cacert.crt ]; then \
+      echo "...スキップ..."; \
+    else \
+      keytool -importcert -noprompt -trustcacerts -alias cacert \
+        -file /run/secrets/cacert.crt \
+        -keystore "${JAVA_HOME}/lib/security/cacerts" -storepass changeit; \
+      keytool -importcert -noprompt -trustcacerts -alias cacert \
+        -file /run/secrets/cacert.crt \
+        -keystore "${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12" \
+        -storetype PKCS12 -storepass changeit; \
+      ... /opt/pki/build-import.txt に取り込み記録を残す ... \
+    fi
+```
+
+| | ビルド時取り込み (build secret) | 実行時取り込み (entrypoint) |
+|---|---|---|
+| 実行ユーザ | `root` → **JDK 同梱 cacerts を直接更新できる** | `jboss` (185) → `/tmp/pki/cacerts` へコピーして追加 |
+| JBoss 側ストア | ビルド時に `jboss-truststore.p12` を作り込む | 毎起動で作り直す |
+| 証明書の入手元 | build secret (ホストのファイル) | `${PKI_TRUST_DIR}` (named volume) |
+| 証明書を差し替えたら | **イメージの再ビルドが必要** | コンテナの再起動だけで反映 |
+| `pki` volume 無しで動くか | **動く** (イメージに焼き込み済み) | 動かない (取り込みがスキップされる) |
+
+- **`secret` を渡さなければこの `RUN` は何もしない**ため、従来どおりの
+  `docker compose up -d --build` は一切影響を受けない。
+- `--mount=type=secret` はビルド中だけ tmpfs にマウントされ、**イメージのレイヤーにも
+  ビルドキャッシュにも残らない**。`COPY` で持ち込むのとはここが違う。
+- `compose.build-secret.yaml` を本体の `compose.yaml` に統合していないのは、
+  compose の `secrets(file:)` は参照先ファイルが無いと `build` が失敗するため。
+  `cacert.crt` は `pki-init` を起動して初めて出力されるので、本体に入れると
+  まっさらな clone でのビルドが通らなくなる。
+
+取り込まれたことの確認:
+
+```bash
+docker compose logs app-front | grep 'truststore\[build\]'
+docker compose exec app-front cat /opt/pki/build-import.txt
+curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha256'
+openssl x509 -in compose/pki/export/cacert.crt -noout -fingerprint -sha256   # ↑と一致するはず
+```
+
+### 3-4. 使い道 2 — `compose/pki/provided/` へ置いて CA を固定する
+
+出力された `cacert.crt` は **`compose/pki/provided/` へコピーするだけでそのまま使える**
+(形式変換もリネームも不要)。次回以降 `pki-init` は `provided` モードになり、
+同じ CA を使い続ける = **自動発行した CA を「受領物」として固定できる**。
+
+```bash
+cp compose/pki/export/cacert.crt compose/pki/provided/cacert.crt
+cp compose/pki/export/cacert.key compose/pki/provided/cacert.key   # 鍵も出ていれば
+docker compose restart pki-init
+docker compose restart secure-api alb mysql app-front app-back
+docker compose logs pki-init | grep -E 'MODE:|SHA-256'
+```
+
+`./pki-export.sh --to-provided` がこのコピーを代行する。
+
+`cacert.key` を**一緒に置くかどうか**で 2-2 のパターンが決まる。
+
+| 置いたもの | 結果 |
+|---|---|
+| `cacert.crt` + `cacert.key` | パターン A — 受領 CA が全サーバ証明書を発行 (指紋も CA も完全に同じまま) |
+| `cacert.crt` のみ | パターン B — サーバ証明書は `local-test-ca` が発行。`cacert.crt` はトラストアンカー専用 |
+
+鍵を持ち出したくない場合は `.env` で `PKI_EXPORT_KEY=0` を指定する
+(その場合、出力物を `provided/` へ置くと必ずパターン B になる)。
+
+### 3-5. ベースイメージのビルドコンテキストへ直接出力する
+
+出力先そのものをビルドコンテキスト配下へ向けられる。「所定のディレクトリ」が
+決まっている場合はこれが一番手数が少ない。
+
+```dotenv
+# .env
+PKI_EXPORT_DIR=../base-image/secrets
+```
+
+`./pki-export.sh --to ../base-image/secrets` でも同じ配置ができる。
+
+### 3-6. 環境変数
+
+| 変数 | 既定値 | 説明 |
+|---|---|---|
+| `PKI_EXPORT_DIR` | `./compose/pki/export` | 出力先の**ホスト**パス。`pki-init` へ `/export` として read-write で bind mount する。マウントが無ければ出力しない (警告のみ) |
+| `PKI_EXPORT_KEY` | `1` | `cacert.key` も出力するか。`0` で出力しない |
+| `PKI_BUILD_SECRET_FILE` | `./compose/pki/export/cacert.crt` | `compose.build-secret.yaml` がビルドへ渡すファイル。受領物を直接渡すなら `./compose/pki/provided/cacert.crt` |
+| `CACERT_ALIAS` (build arg) | `cacert` | ビルド時取り込みで使う keytool の alias |
+| `JVM_TRUSTSTORE_PASSWORD` / `JBOSS_TRUSTSTORE_PASSWORD` (build arg) | `changeit` | ビルド時に書き込む各ストアのパスワード |
+
+### 3-7. 一覧表 (Excel)
+
+本章の内容 (出力ファイル / 環境変数 / 手順 / ビルド時と実行時の違い / トラブル対応 /
+実 AWS への読み替え) は **[`PKI-CACERT-EXPORT.xlsx`](PKI-CACERT-EXPORT.xlsx)** に
+8 シートの表としてまとめてある。配布・レビュー用にはこちらが早い。
+
+| シート | 内容 |
+|---|---|
+| `1.概要` | 配備 → 出力 → 受け渡し → 取り込み → 検証 の 6 ステップ |
+| `2.出力ファイル` | `compose/pki/export/` に出る各ファイルの出力条件と使い道 |
+| `3.build secret` | 渡し方 / Dockerfile 側の実装 / 取り込み先 / 確認方法 |
+| `4.ビルド時と実行時` | 2 経路の比較 (実行ユーザ・実体・差し替え時の作業・volume 依存) |
+| `5.環境変数` | `.env` / `compose.yaml` / build arg の全変数 |
+| `6.手順` | よく使う 4 パターンの手順と期待値 |
+| `7.トラブル対応` | 症状 → 原因 → 対処 |
+| `8.実AWSへの読み替え` | ローカルと実 AWS の対応 |
+
+xlsx はバイナリで差分レビューできないため、**内容の変更は生成スクリプトを直して再生成する**。
+
+```bash
+python docs/tools/gen-pki-cacert-xlsx.py     # 要 openpyxl
+```
+
+詳細は [`compose/pki/export/README.md`](../compose/pki/export/README.md) を参照。
+
+---
+
+## 4. トラストストアへの取り込み (front / back)
 
 `docker/front/entrypoint.sh` と `docker/back/entrypoint.sh` の
 `import_trusted_certs()` が起動時に実行する。**アプリコードは無改変**。
 取り込み先は **2 か所**。
+
+> ビルド時に build secret で焼き込む経路 (3 章) と併用できる。
+> `${PKI_TRUST_DIR}` に `*.crt` が無ければこの実行時取り込みはスキップされ、
+> **ビルド時に焼き込んだトラストストアがそのまま使われる**。
+> ビルド時取り込みの記録がある場合は起動ログに `truststore[build]:` が出る。
 
 ```
 1. /mnt/pki/trust/*.crt があるか確認 (無ければスキップして通常起動)
@@ -298,7 +525,7 @@ JDK 側の `trustStoreType` は**あえて指定していない** (JKS / PKCS12 
 
 ---
 
-## 4. テスト用の接続先 (secure-api)
+## 5. テスト用の接続先 (secure-api)
 
 app-front / app-back が「トラストストアへ取り込んだ `cacert.crt` で接続できるか」を
 確認するための接続先。WireMock を `--disable-http` 付きで起動し、
@@ -328,7 +555,7 @@ command:
 
 ---
 
-## 5. ALB (HTTPS リスナー)
+## 6. ALB (HTTPS リスナー)
 
 `compose/alb/nginx.conf` に `listen 443 ssl` の server ブロックを追加した。
 
@@ -384,7 +611,7 @@ HTTPS リスナーのルーティング (`rules-tls/10-secure-routes.conf`):
 
 ---
 
-## 6. 検証方法
+## 7. 検証方法
 
 ### 6-1. 一括検証
 
@@ -561,7 +788,7 @@ curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha2
 
 ---
 
-## 7. 証明書を入れ替える / 作り直す
+## 8. 証明書を入れ替える / 作り直す
 
 ### 7-1. 受領した cacert.crt を差し替える
 
@@ -593,11 +820,13 @@ volume ごと消す場合は `docker compose down -v` (MySQL 等のデータも�
 
 ---
 
-## 8. 実 AWS への読み替え
+## 9. 実 AWS への読み替え
 
 | ローカル | 実 AWS |
 |---|---|
 | `compose/pki/provided/cacert.crt` (受領物) | 社内 CA / 取引先から連携される自己署名ルート証明書そのもの |
+| `compose/pki/export/cacert.crt` (出力) | CI がビルド前に取得する CA 証明書<br>(S3 / Secrets Manager / SSM / 社内配布サーバから落としてビルドコンテキストへ置く) |
+| `--secret id=cacert` でのビルド時取り込み | 同じ。CodeBuild なら `docker build --secret` に<br>Secrets Manager から取得したファイルを渡す (イメージ層に残さない) |
 | `pki-init` の `cacert.crt` | AWS Private CA (ACM PCA) のルート CA / 社内 CA の自己署名証明書 |
 | `local-test-ca` (鍵なし受領時のみ) | ローカル専用。実 AWS には対応物が無い (受領 CA の鍵を持たないための代替) |
 | `secure-api` (WireMock HTTPS) | 自己証明書で HTTPS を要求する外部 API / 社内システム |
@@ -620,10 +849,16 @@ ECS タスク定義へ持ち込む場合の注意:
 
 ---
 
-## 9. トラブルシューティング
+## 10. トラブルシューティング
 
 | 症状 | 原因 / 対処 |
 |---|---|
+| `compose/pki/export/` に何も出力されない | `pki-init` の起動ログに `export: /export が無いため出力しません` が出ていないか確認。出ていれば bind mount が無い (compose.yaml の `${PKI_EXPORT_DIR:-./compose/pki/export}:/export`)。`docker compose up -d pki-init` で作り直すか `./pki-export.sh` で取り出す |
+| `WARN: export: /export へ書き込めません` | 出力先を `:ro` でマウントしている。`PKI_EXPORT_DIR` に指定したホストパスの書き込み権限も確認する |
+| `docker compose build` が `secret ... no such file or directory` で失敗 | `compose/pki/export/cacert.crt` がまだ無い。先に `docker compose up -d pki-init` (もしくは `./pki-export.sh`) を実行する。`compose.build-secret.yaml` を使うときだけ必要 |
+| build secret を渡したのに取り込まれない | ビルドログに `[build][cacert] ... スキップします` が出ていれば secret が届いていない。`-f compose.build-secret.yaml` を付けているか、`docker build` なら `--secret id=cacert,src=...` の `id` が `cacert` かを確認。BuildKit が無効 (`DOCKER_BUILDKIT=0`) でも渡らない |
+| ビルド時に取り込んだのに実行時の中身が違う | `${PKI_TRUST_DIR}` に `*.crt` があると JBoss 側ストアは毎起動で作り直される (JDK 側は cacerts のコピーなのでビルド時の分も残る)。`docker compose logs app-front \| grep truststore` で両方の経路を確認 |
+| 出力物を `provided/` へ置いたら `cacert.key は cacert.crt の秘密鍵ではありません` | 配置先に**古い `cacert.key` が残っている**。`compose/pki/provided/` の鍵を消してから置き直す (`./pki-export.sh --to-provided` は自動で消す) |
 | 受領した `cacert.crt` が使われていない | `docker compose logs pki-init \| grep 'MODE:'` が `generate` なら受領物を認識していない。`compose/pki/provided/cacert.crt` のパス / ファイル名を確認 (`.env` で `PKI_PROVIDED_DIR` を変えている場合はそのパス)。確実に失敗させたいなら `.env` に `PKI_MODE=provided` |
 | `cacert.crt を X.509 証明書として読めません` | 受領物が PEM / DER のどちらでもない (テキスト混入、破損、PKCS#7 / PKCS#12 など)。`openssl x509 -in cacert.crt -noout -text` で確認 |
 | `cacert.key は cacert.crt の秘密鍵ではありません` | 鍵と証明書の取り違え。`openssl x509 -in cacert.crt -noout -pubkey` と `openssl pkey -in cacert.key -pubout` を比較 |
@@ -635,7 +870,7 @@ ECS タスク定義へ持ち込む場合の注意:
 | `トラストストアを読めません: .../jboss-truststore.p12` | entrypoint がストアを生成する前に落ちている。`PKI_TRUST_DIR` に `*.crt` があるか確認 |
 | EAP 起動時に `appTrustStore` 関連の WARN | ストアファイルが未生成のまま起動した (`required=false` のため起動自体は成功する)。pki volume のマウントと `depends_on: pki-init` を確認 |
 | `No subject alternative names matching...` | 接続先ホスト名が SAN に無い。`PKI_SECURE_API_SAN` / `PKI_ALB_SAN` へ追加して再生成 |
-| tls-verifier が「旧レイアウトが残っています」で FAIL | `PKI_FORCE_REGENERATE=1` で作り直す (手順は 7 章) |
+| tls-verifier が「旧レイアウトが残っています」で FAIL | `PKI_FORCE_REGENERATE=1` で作り直す (手順は 8 章) |
 | nginx が `cannot load certificate` で起動しない | pki-init より先に alb が起動した。`depends_on: pki-init: service_healthy` が効いているか確認。`docker compose logs pki-init` |
 | `secure-api` が起動直後に終了する | WireMock のオプション不一致。`docker compose logs secure-api` を確認。使用中の WireMock で `--disable-http` が未対応の場合は、その行を削除して `--port=8080` を無視する運用に切り替える (HTTPS 経路の検証内容は変わらない) |
 | front/back の起動が遅い | EAP の `start_period` が 120s。`tls-verifier` は最大 `WAIT_SECONDS` (既定 180s) 待つ |
@@ -644,11 +879,18 @@ ECS タスク定義へ持ち込む場合の注意:
 
 ---
 
-## 10. セキュリティ上の注意 (テスト環境専用)
+## 11. セキュリティ上の注意 (テスト環境専用)
 
 - **受領した証明書 / 秘密鍵はコミットしないこと。** `compose/pki/provided/` は
   `README.md` と `.gitkeep` を除いて `.gitignore` 済み。イメージにも含めない
   (`compose/pki/.dockerignore` でビルドコンテキストから除外している)。
+- **出力先 `compose/pki/export/` も同様に `.gitignore` 済み。**
+  既定では `cacert.key` (CA の秘密鍵) もここへ出力される。持ち出したくない場合は
+  `.env` で `PKI_EXPORT_KEY=0` を指定する。
+- ビルドへの受け渡しに `--mount=type=secret` を使っているのは、**イメージのレイヤーにも
+  ビルドキャッシュにも残さない**ため。`COPY` で証明書を持ち込むと
+  `docker history` / レイヤー展開で取り出せてしまう。CA 証明書自体は公開してよいものだが、
+  同じ経路で他の秘密を渡す場合に効いてくる。
 - 受領物に `cacert.key` が含まれる場合、それは **CA の秘密鍵** であり、
   持っている人は任意のサーバ証明書を発行できる。ローカル検証用途に限り、
   取り扱い範囲を必ず確認すること。

@@ -62,6 +62,55 @@ RUN "${JBOSS_HOME}/bin/jboss-cli.sh" --file=/tmp/config.cli \
  && chown -R 185:0 "${JBOSS_HOME}/standalone" "${JBOSS_HOME}/modules" \
  && chmod -R g=u "${JBOSS_HOME}/standalone"
 
+# -----------------------------------------------------------------------------
+# ★自己証明書 (cacert.crt) のビルド時取り込み — BuildKit の build secret 経由
+# (front/Dockerfile と完全に同一。詳細なコメントはそちらを参照)
+# -----------------------------------------------------------------------------
+# 社内標準ベースイメージと同じ方式で、pki-init が出力した cacert.crt を
+# JVM (JDK 同梱 cacerts) と JBoss EAP (Elytron の appTrustStore が参照する
+# jboss-truststore.p12) の両トラストストアへビルド時に焼き込む。
+#   docker compose -f compose.yaml -f compose.build-secret.yaml build app-back
+# secret 未指定なら何もしない (従来どおり entrypoint.sh が起動時に取り込む)。
+ARG CACERT_ALIAS=cacert
+ARG JVM_TRUSTSTORE_PASSWORD=changeit
+ARG JBOSS_TRUSTSTORE_PASSWORD=changeit
+RUN --mount=type=secret,id=cacert,target=/run/secrets/cacert.crt \
+    set -eu; \
+    if [ ! -s /run/secrets/cacert.crt ]; then \
+      echo "[build][cacert] build secret 'cacert' が渡されていないためビルド時取り込みをスキップします"; \
+      echo "[build][cacert] (実行時に entrypoint.sh が \${PKI_TRUST_DIR} から取り込みます)"; \
+    else \
+      JDK_CACERTS=""; \
+      for c in "${JAVA_HOME:-}/lib/security/cacerts" /etc/pki/java/cacerts; do \
+        if [ -f "$c" ]; then JDK_CACERTS="$c"; break; fi; \
+      done; \
+      if [ -z "$JDK_CACERTS" ]; then \
+        echo "[build][cacert] ERROR: JDK 同梱の cacerts が見つかりません"; exit 1; \
+      fi; \
+      keytool -importcert -noprompt -trustcacerts \
+        -alias "${CACERT_ALIAS}" -file /run/secrets/cacert.crt \
+        -keystore "$JDK_CACERTS" -storepass "${JVM_TRUSTSTORE_PASSWORD}"; \
+      keytool -importcert -noprompt -trustcacerts \
+        -alias "${CACERT_ALIAS}" -file /run/secrets/cacert.crt \
+        -keystore "${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12" \
+        -storetype PKCS12 -storepass "${JBOSS_TRUSTSTORE_PASSWORD}"; \
+      chown 185:0 "${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12"; \
+      chmod 0640  "${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12"; \
+      mkdir -p /opt/pki; \
+      { echo "imported-at : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"; \
+        echo "alias       : ${CACERT_ALIAS}"; \
+        echo "source      : build secret id=cacert (ビルド時取り込み)"; \
+        echo "jdk store   : $JDK_CACERTS"; \
+        echo "jboss store : ${JBOSS_HOME}/standalone/configuration/jboss-truststore.p12"; \
+        keytool -printcert -file /run/secrets/cacert.crt 2>/dev/null \
+          | grep -aE 'Owner|Issuer|SHA256|SHA-256|所有者|発行者|フィンガプリント' \
+          | sed 's/^[[:space:]]*/cert        : /' || true; \
+      } > /opt/pki/build-import.txt; \
+      chmod 0644 /opt/pki/build-import.txt; \
+      echo "[build][cacert] cacert.crt を JDK cacerts と jboss-truststore.p12 へ取り込みました"; \
+      cat /opt/pki/build-import.txt; \
+    fi
+
 COPY --chown=185:0 back/app/ ${JBOSS_HOME}/standalone/deployments/
 
 # 非同期チェーンの受け口サーブレット (コンテキストルート /async → /async/receive)

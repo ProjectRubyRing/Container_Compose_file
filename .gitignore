@@ -11,6 +11,13 @@ compose/pki/provided/*
 !compose/pki/provided/README.md
 !compose/pki/provided/.gitkeep
 
+# pki-init が書き出す cacert.crt の出力口 (build secret の入力 / provided への配置元)。
+# テスト用証明書と CA 秘密鍵が出るためコミットしない
+# (README.md と .gitkeep だけを管理対象にする)
+compose/pki/export/*
+!compose/pki/export/README.md
+!compose/pki/export/.gitkeep
+
 # Terraform (terraform/ 配下)。.terraform.lock.hcl は再現性のためコミットする
 **/.terraform/*
 *.tfstate
