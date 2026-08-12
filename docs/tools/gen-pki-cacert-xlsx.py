@@ -107,7 +107,7 @@ sheet(
         ["★4a", "ビルドへ受け渡し", "build secret (id=cacert)",
          "ベースイメージと同じ方式。ビルド中だけ tmpfs にマウントされ、イメージのレイヤーにも "
          "ビルドキャッシュにも残らない。JDK cacerts と jboss-truststore.p12 へ keytool で焼き込む。",
-         "docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back"],
+         "docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend"],
         ["★4b", "受領物として固定", "compose/pki/provided/",
          "出力された cacert.crt をそのまま provided/ へ置くと、次回以降その CA を使い続ける。"
          "自動発行した CA を固定できる (入力と出力が往復する)。",
@@ -115,7 +115,7 @@ sheet(
         ["5", "実行時取り込み", "entrypoint.sh (front / back)",
          "/mnt/pki/trust/*.crt を keytool で JDK 側 (cacerts のコピー) と JBoss 側 "
          "(jboss-truststore.p12) の 2 ストアへ取り込む。従来からの経路でそのまま残る。",
-         "docker compose logs app-front | grep truststore"],
+         "docker compose logs frontend | grep truststore"],
         ["6", "検証", "tls-verifier / tls-probe",
          "secure-api・ALB への HTTPS 呼び出しが JDK 経路 / JBoss 経路の両方で通ること、"
          "および取り込まれた証明書の SHA-256 が出力物と一致することを確認する。",
@@ -169,7 +169,7 @@ sheet(
     ["項目", "内容", "備考"],
     [
         ["★渡し方 (compose)",
-         "docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back",
+         "docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend",
          "compose.build-secret.yaml が build.secrets: [cacert] と secrets.cacert.file を配線する"],
         ["★渡し方 (docker build)",
          "docker build --secret id=cacert,src=compose/pki/export/cacert.crt -f front/Dockerfile ./docker",
@@ -191,8 +191,8 @@ sheet(
          "何もしない (ログに [build][cacert] ... スキップします)",
          "従来どおり entrypoint.sh が起動時に ${PKI_TRUST_DIR} から取り込む"],
         ["確認方法",
-         "docker compose logs app-front | grep 'truststore[build]'\n"
-         "docker compose exec app-front cat /opt/pki/build-import.txt\n"
+         "docker compose logs frontend | grep 'truststore[build]'\n"
+         "docker compose exec frontend cat /opt/pki/build-import.txt\n"
          "curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha256'",
          "最後の指紋が compose/pki/export/cacert.crt の SHA-256 と一致すれば同一の証明書"],
         ["build arg",
@@ -289,7 +289,7 @@ sheet(
         ["", "2", "ls compose/pki/export/",
          "cacert.crt / cacert.key / verify-bundle.crt / trust/ / MANIFEST.txt"],
         ["", "3",
-         "docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back",
+         "docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend",
          "ビルドログに [build][cacert] cacert.crt を ... 取り込みました"],
         ["", "4",
          "docker compose -f compose.yaml -f compose.build-secret.yaml up -d",
@@ -300,14 +300,14 @@ sheet(
         ["", "2", "docker compose restart pki-init",
          "ログが MODE: provided になる"],
         ["", "3",
-         "docker compose restart secure-api alb mysql app-front app-back",
+         "docker compose restart secure-api alb mysql frontend backend",
          "指紋が変わらないこと (docker compose logs pki-init | grep SHA-256)"],
         ["C. 受領した cacert.crt を使う", "1",
          "cp /path/to/受領した/cacert.crt compose/pki/provided/cacert.crt",
          "鍵があれば cacert.key も一緒に置く"],
         ["", "2", "docker compose up -d --build", "docker compose logs pki-init | grep 'MODE:' が provided"],
         ["", "3",
-         "docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back",
+         "docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend",
          "受領物がそのままイメージへ焼き込まれる (export 経由)"],
         ["D. ベースイメージのビルドへ渡す", "1",
          "echo 'PKI_EXPORT_DIR=../base-image/secrets' >> .env",
@@ -351,10 +351,10 @@ sheet(
         ["ビルド時に焼き込んだのに実行時の中身が違う",
          "PKI_TRUST_DIR に *.crt があると JBoss 側ストアは毎起動で作り直される "
          "(JDK 側は cacerts のコピーなのでビルド時の分も残る)",
-         "docker compose logs app-front | grep truststore で [build] と [jboss] の両方を確認する"],
+         "docker compose logs frontend | grep truststore で [build] と [jboss] の両方を確認する"],
         ["tls-probe の cacertSha256 が出力物と一致しない",
          "別の CA が入っている / PKI を作り直した後に front/back を再起動していない",
-         "docker compose restart app-front app-back。"
+         "docker compose restart frontend backend。"
          "それでも直らなければ docker compose logs pki-init | grep SHA-256 と突き合わせる"],
         ["出力物を provided/ へ置いたら local-test-ca が作られた",
          "cacert.key を出力していない (PKI_EXPORT_KEY=0) / 一緒に置いていない",

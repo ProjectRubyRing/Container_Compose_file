@@ -8,10 +8,10 @@
 # 検証する経路:
 #   (A) tls-verifier → secure-api            HTTPS 直接 (cacert 検証あり/なしの対照実験)
 #   (B) tls-verifier → ALB(HTTPS) → secure-api  ALB で TLS 終端 → 再暗号化
-#   (C) app-front(JVM) → secure-api          ★JDK トラストストア経由 (本命)
-#   (D) app-front(JVM) → secure-api          ★JBoss トラストストア経由 (本命)
-#   (E) app-back(JVM)  → secure-api          ★同上 (JDK / JBoss 両方)
-#   (F) app-front/back(JVM) → ALB(HTTPS) → secure-api  ★ALB 経由の確認
+#   (C) frontend(JVM) → secure-api          ★JDK トラストストア経由 (本命)
+#   (D) frontend(JVM) → secure-api          ★JBoss トラストストア経由 (本命)
+#   (E) backend(JVM)  → secure-api          ★同上 (JDK / JBoss 両方)
+#   (F) frontend/backend(JVM) → ALB(HTTPS) → secure-api  ★ALB 経由の確認
 #   (G) 空トラストストアでは必ず失敗すること (対照実験)
 #
 # 期待値どおりなら PASS、そうでなければ FAIL を出力し、FAIL 数を終了コードにする。
@@ -39,8 +39,8 @@ ALB_HOST="${ALB_HOST:-alb}"
 ALB_HTTPS_PORT="${ALB_HTTPS_PORT:-443}"
 ALB_BASE="https://${ALB_HOST}:${ALB_HTTPS_PORT}"
 
-FRONT_PROBE="${FRONT_PROBE:-http://app-front:8080/tls-probe}"
-BACK_PROBE="${BACK_PROBE:-http://app-back:8180/tls-probe}"
+FRONT_PROBE="${FRONT_PROBE:-http://frontend:8080/tls-probe}"
+BACK_PROBE="${BACK_PROBE:-http://backend:8180/tls-probe}"
 
 WAIT_SECONDS="${WAIT_SECONDS:-180}"
 MODE="${1:-full}"
@@ -203,10 +203,10 @@ wait_for_tcp "${SECURE_API_HOST}" "${SECURE_API_PORT}" "secure-api(HTTPS)" \
 wait_for_tcp "${ALB_HOST}" "${ALB_HTTPS_PORT}" "alb(HTTPS)" \
   && pass "alb:${ALB_HTTPS_PORT} が listen" || fail "alb:${ALB_HTTPS_PORT} に接続できない"
 
-wait_for_http "${FRONT_PROBE}/truststore" "app-front(tls-probe)" \
-  && pass "app-front の tls-probe が応答" || fail "app-front の tls-probe が応答しない"
-wait_for_http "${BACK_PROBE}/truststore" "app-back(tls-probe)" \
-  && pass "app-back の tls-probe が応答" || fail "app-back の tls-probe が応答しない"
+wait_for_http "${FRONT_PROBE}/truststore" "frontend(tls-probe)" \
+  && pass "frontend の tls-probe が応答" || fail "frontend の tls-probe が応答しない"
+wait_for_http "${BACK_PROBE}/truststore" "backend(tls-probe)" \
+  && pass "backend の tls-probe が応答" || fail "backend の tls-probe が応答しない"
 
 # ---------------------------------------------------------------------------
 # (A) tls-verifier → secure-api への直接 HTTPS
@@ -320,7 +320,7 @@ fi
 # ---------------------------------------------------------------------------
 # (C)〜(G) front / back の JVM から呼ぶ ★本命
 # ---------------------------------------------------------------------------
-head1 "7. ★受領した cacert.crt が app-front / app-back の JDK / JBoss 両トラストストアに入っているか"
+head1 "7. ★受領した cacert.crt が frontend / backend の JDK / JBoss 両トラストストアに入っているか"
 info "照合対象 (受領物 ${PROVIDED_CA}) の SHA-256: ${PROVIDED_CA_FP}"
 
 # 1 つのストア (jdk / jboss) について、cacert が入っているかを判定する。
@@ -357,7 +357,7 @@ check_store() {  # $1=表示名 $2=truststore JSON $3=ストア名
   fi
 }
 
-for pair in "app-front|${FRONT_PROBE}" "app-back|${BACK_PROBE}"; do
+for pair in "frontend|${FRONT_PROBE}" "backend|${BACK_PROBE}"; do
   name="${pair%%|*}"; base="${pair##*|}"
   ts="$(curl -s --max-time 10 "${base}/truststore")"
   if echo "${ts}" | jq -e '.stores' >/dev/null 2>&1; then
@@ -406,17 +406,17 @@ check_probe() {  # $1=表示名 $2=probe base $3=target $4=trust(jdk|jboss|none)
 }
 
 # 同じ URL・同じアプリコードで、取り込み先 (JDK / JBoss) の違いだけを比較する
-check_probe "app-front(JVM)" "${FRONT_PROBE}" "direct" "jdk"
-check_probe "app-front(JVM)" "${FRONT_PROBE}" "direct" "jboss"
-check_probe "app-back(JVM)"  "${BACK_PROBE}"  "direct" "jdk"
-check_probe "app-back(JVM)"  "${BACK_PROBE}"  "direct" "jboss"
+check_probe "frontend(JVM)" "${FRONT_PROBE}" "direct" "jdk"
+check_probe "frontend(JVM)" "${FRONT_PROBE}" "direct" "jboss"
+check_probe "backend(JVM)"  "${BACK_PROBE}"  "direct" "jdk"
+check_probe "backend(JVM)"  "${BACK_PROBE}"  "direct" "jboss"
 
 head1 "9. ★front/back の JVM から ALB(HTTPS) 経由で REST API を呼び出せるか"
 
-check_probe "app-front(JVM)→ALB" "${FRONT_PROBE}" "alb" "jdk"
-check_probe "app-front(JVM)→ALB" "${FRONT_PROBE}" "alb" "jboss"
-check_probe "app-back(JVM)→ALB"  "${BACK_PROBE}"  "alb" "jdk"
-check_probe "app-back(JVM)→ALB"  "${BACK_PROBE}"  "alb" "jboss"
+check_probe "frontend(JVM)→ALB" "${FRONT_PROBE}" "alb" "jdk"
+check_probe "frontend(JVM)→ALB" "${FRONT_PROBE}" "alb" "jboss"
+check_probe "backend(JVM)→ALB"  "${BACK_PROBE}"  "alb" "jdk"
+check_probe "backend(JVM)→ALB"  "${BACK_PROBE}"  "alb" "jboss"
 
 head1 "10. 対照実験: 空のトラストストアでは必ず失敗すること"
 
@@ -433,8 +433,8 @@ check_probe_must_fail() {  # $1=表示名 $2=probe base
   fi
 }
 
-check_probe_must_fail "app-front(JVM)" "${FRONT_PROBE}"
-check_probe_must_fail "app-back(JVM)"  "${BACK_PROBE}"
+check_probe_must_fail "frontend(JVM)" "${FRONT_PROBE}"
+check_probe_must_fail "backend(JVM)"  "${BACK_PROBE}"
 
 # ---------------------------------------------------------------------------
 # まとめ
@@ -466,10 +466,10 @@ else
   echo "  ${FAIL} 件の検証に失敗しました。上の FAIL 行を確認してください。"
   echo "  よくある原因:"
   echo "   - pki-init が未実行 / 証明書が古い  → docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot"
-  echo "   - 受領 cacert.crt を差し替えた後、front/back が古いまま → docker compose restart app-front app-back"
+  echo "   - 受領 cacert.crt を差し替えた後、front/back が古いまま → docker compose restart frontend backend"
   echo "   - 受領物の内容が想定と違う          → docker compose logs pki-init (subject / 有効期限 / SHA-256 を確認)"
-  echo "   - front/back が証明書取り込み前に起動 → docker compose restart app-front app-back"
-  echo "   - JBoss 側ストアが未生成            → docker compose logs app-front | grep 'truststore\\[jboss\\]'"
+  echo "   - front/back が証明書取り込み前に起動 → docker compose restart frontend backend"
+  echo "   - JBoss 側ストアが未生成            → docker compose logs frontend | grep 'truststore\\[jboss\\]'"
   echo "   - ALB の証明書切り替え直後で reload 未実行 → ./alb-tls-cert.sh status"
   exit "${FAIL}"
 fi

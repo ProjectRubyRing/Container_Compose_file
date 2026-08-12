@@ -1,7 +1,7 @@
-# 非同期処理チェーン (SQS → Lambda → ALB → app-back) ローカル検証ガイド
+# 非同期処理チェーン (SQS → Lambda → ALB → backend) ローカル検証ガイド
 
-app-front / app-back から **非同期に** 処理を投げ、SQS・Lambda・ALB を経由して
-最終的に app-back の Java サーブレットが POST を受け取るまでの一連の流れを、
+frontend / backend から **非同期に** 処理を投げ、SQS・Lambda・ALB を経由して
+最終的に backend の Java サーブレットが POST を受け取るまでの一連の流れを、
 **AWS に一切接続せず** ローカルの compose だけで再現・検証するための構成と手順です。
 
 このドキュメントだけを読めば、
@@ -20,8 +20,8 @@ app-front / app-back から **非同期に** 処理を投げ、SQS・Lambda・AL
 
 ```
 ┌──────────────┐   ①SendMessage        ┌──────────────────────┐
-│ app-front /  │ ────────────────────▶ │  sqs (ElasticMQ)     │
-│ app-back     │   非同期でキューに積む  │  app-async-queue     │
+│ frontend /  │ ────────────────────▶ │  sqs (ElasticMQ)     │
+│ backend     │   非同期でキューに積む  │  app-async-queue     │
 └──────────────┘                        └──────────┬───────────┘
                                                     │ ②ReceiveMessage
                                                     │  (ロングポーリング)
@@ -39,11 +39,11 @@ app-front / app-back から **非同期に** 処理を投げ、SQS・Lambda・AL
                                                     │  /async/receive
                                           ┌─────────▼───────────┐
                                           │ alb (nginx)         │  ← ALB の代替
-                                          │ /async/* → app-back │     (L7 ルーティング)
+                                          │ /async/* → backend │     (L7 ルーティング)
                                           └─────────┬───────────┘
                                                     │ ⑤proxy_pass
                                           ┌─────────▼───────────┐
-                                          │ app-back:8180       │
+                                          │ backend:8180       │
                                           │ AsyncReceiverServlet│  ← Java サーブレット
                                           │ /async/receive      │     (async-receiver.war)
                                           └─────────┬───────────┘
@@ -60,7 +60,7 @@ app-front / app-back から **非同期に** 処理を投げ、SQS・Lambda・AL
 | `lambda-esm` (poller.py) | Lambda **イベントソースマッピング** | SQS をポーリングし Lambda を起動 |
 | `lambda` (RIE + handler.py) | AWS Lambda 関数 | SQS イベントを処理 |
 | `alb` (nginx) | Application Load Balancer | L7 パスルーティング |
-| `app-back` の `/async/receive` | ECS 上の app-back | Java サーブレットが POST を受信 |
+| `backend` の `/async/receive` | ECS 上の `app-back` コンテナ | Java サーブレットが POST を受信 |
 
 > **なぜ `lambda-esm` が必要か？**
 > 実 AWS では「SQS にメッセージが入ると Lambda が自動起動する」ように見えますが、
@@ -74,7 +74,7 @@ app-front / app-back から **非同期に** 処理を投げ、SQS・Lambda・AL
 ## 1. クイックスタート
 
 ```bash
-cp .env.example .env      # EAP_BASE_IMAGE を設定 (app-back のビルドに必要)
+cp .env.example .env      # EAP_BASE_IMAGE を設定 (backend のビルドに必要)
 docker compose up -d --build
 
 # 一連の非同期チェーンをまとめて検証
@@ -91,7 +91,7 @@ docker compose up -d --build
 | http://localhost:9001 | メンテナンス Lambda を直接 invoke |
 | http://localhost:9080 | ALB (nginx)。`/async/receive`, `/maintenance`, `/healthz` |
 | http://localhost:9081 | alb-lambda-adapter 直接 (ALB→Lambda 変換の確認用) |
-| http://localhost:8180 | app-back 直接 (`/async/receive`) |
+| http://localhost:8180 | backend 直接 (`/async/receive`) |
 
 ---
 
@@ -149,8 +149,8 @@ queues {
 
 ### 2-3. メッセージの積み方 (プロデューサ)
 
-実 AWS では app-front / app-back が **AWS SDK (SendMessage)** でキューに積みます。
-compose 環境では endpoint を `sqs` に向けるだけです。app-front / app-back には
+実 AWS では frontend / backend が **AWS SDK (SendMessage)** でキューに積みます。
+compose 環境では endpoint を `sqs` に向けるだけです。frontend / backend には
 `ASYNC_SQS_ENDPOINT=http://sqs:9324` と `ASYNC_QUEUE_NAME=app-async-queue` を
 環境変数で渡してあります。
 
@@ -259,7 +259,7 @@ def lambda_handler(event, context):
         message_id = record.get("messageId", "")
         body = record.get("body", "")
         try:
-            status, _ = _post_to_back(body, message_id)   # ALB 経由で app-back へ POST
+            status, _ = _post_to_back(body, message_id)   # ALB 経由で backend へ POST
             if not (200 <= status < 300):
                 batch_item_failures.append({"itemIdentifier": message_id})
         except Exception:
@@ -288,7 +288,7 @@ environment:
 curl -s -XPOST \
   "http://localhost:9000/2015-03-31/functions/function/invocations" \
   -d '{"Records":[{"messageId":"m-1","body":"{\"hello\":\"world\"}"}]}'
-# → {"batchItemFailures": []}  (成功。app-back に POST が届く)
+# → {"batchItemFailures": []}  (成功。backend に POST が届く)
 ```
 
 ---
@@ -329,7 +329,7 @@ curl -s -XPOST \
 
   | nginx | ALB の概念 |
   |---|---|
-  | `upstream app_back { server app-back:8180; }` | ターゲットグループ (app-back) |
+  | `upstream app_back { server backend:8180; }` | ターゲットグループ (backend) |
   | `listen 80;` | リスナー (HTTP :80) |
   | `location /async/ { proxy_pass ... }` | リスナールール「パスが `/async/*` なら転送」 |
   | `proxy_set_header X-Forwarded-*` | ALB が付与するヘッダ |
@@ -338,7 +338,7 @@ curl -s -XPOST \
 
 ```nginx
 upstream app_back {
-    server app-back:8180;          # app-back は port-offset=100 で 8180
+    server backend:8180;          # backend は port-offset=100 で 8180
 }
 
 server {
@@ -348,7 +348,7 @@ server {
         return 200 "alb-ok\n";
     }
 
-    location /async/ {              # ← リスナールール: /async/* を app-back へ
+    location /async/ {              # ← リスナールール: /async/* を backend へ
         proxy_set_header Host              $host;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -358,7 +358,7 @@ server {
 ```
 
 - Lambda は `http://alb:80/async/receive` に POST します。
-- nginx はパスを保持したまま `app-back:8180/async/receive` へ転送します。
+- nginx はパスを保持したまま `backend:8180/async/receive` へ転送します。
 - **パスの一致が肝**です。3 者を必ず揃えます:
   - Lambda の `BACK_PATH` = `/async/receive`
   - nginx の `location /async/`
@@ -378,7 +378,7 @@ curl -XPOST http://localhost:9080/async/receive \
 
 ---
 
-## 6. app-back 側 Java サーブレット (`async-receiver.war`)
+## 6. backend 側 Java サーブレット (`async-receiver.war`)
 
 ### 6-1. 配置と URL の確定
 
@@ -408,7 +408,7 @@ async-receiver.war             ← ${JBOSS_HOME}/standalone/deployments/ に配�
 
 ### 6-3. 受信時の挙動
 
-- POST ボディを **標準出力** (`docker logs app-back`) に記録
+- POST ボディを **標準出力** (`docker logs backend`) に記録
 - 書き込み可能なら **偽装 EFS** `/mnt/logs/app-back-async.log` にも追記
   (cwagent が拾い、CloudWatch Logs モックへ転送されるのも確認できる)
 - `200 OK` を JSON で返す (`{"status":"received", ...}`)
@@ -420,7 +420,7 @@ async-receiver.war             ← ${JBOSS_HOME}/standalone/deployments/ に配�
 `./verify-async.sh` が下記を自動実行します。手動で追う場合は以下。
 
 ```bash
-# 1) キューにメッセージを投入 (プロデューサ = app-front/app-back 相当)
+# 1) キューにメッセージを投入 (プロデューサ = frontend/backend 相当)
 docker compose exec sqs \
   sh -c 'wget -qO- "http://localhost:9324/?Action=SendMessage&QueueName=app-async-queue&MessageBody=%7B%22orderId%22%3A%22A-1001%22%7D"' \
   >/dev/null 2>&1 || \
@@ -428,11 +428,11 @@ aws --endpoint-url http://localhost:9324 --region ap-northeast-1 sqs send-messag
   --queue-url http://localhost:9324/000000000000/app-async-queue \
   --message-body '{"orderId":"A-1001","action":"createReport"}'
 
-# 2) poller が Lambda を起動し、Lambda が ALB 経由で app-back を POST 呼び出し
+# 2) poller が Lambda を起動し、Lambda が ALB 経由で backend を POST 呼び出し
 docker compose logs --tail 20 lambda-esm   # "received 1 message(s); invoking lambda"
 docker compose logs --tail 20 lambda       # {"handler":"lambda_handler","received":1,...}
 docker compose logs --tail 20 alb          # "POST /async/receive" status=200
-docker compose logs --tail 20 app-back | grep async-receiver
+docker compose logs --tail 20 backend | grep async-receiver
 #   ... [app-back][async-receiver] source=lambda-local messageId=... body={"orderId":"A-1001"...}
 
 # 3) 正常処理されたメッセージはキューから消える
@@ -461,9 +461,9 @@ Python コードも ALB のルール切り替えも、どちらも **差し替�
               │  /  , /async/  ── 10-routes.conf ──┐   │
               │   (★切り替え可能★)            │   │   │
               └──────────────────────────────┼───┼───┘
-                     通常=app-back            │   │全面メンテ=maint
+                     通常=backend            │   │全面メンテ=maint
                                               ▼   ▼
-                                   app-back   alb-lambda-adapter
+                                   backend   alb-lambda-adapter
                                    :8180        │ (HTTP↔Lambda 変換)
                                                 ▼
                                      maintenance-lambda (RIE)
@@ -516,7 +516,7 @@ compose/alb/rules/
   00-maintenance-path.conf     # 常時有効: /maintenance* → メンテナンス Lambda
   10-routes.conf               # ★切り替え対象★ 通常 or 全面メンテ (現在の実体)
   variants/
-    10-routes.normal.conf      # 切り替えソース: 通常 (すべて app-back)
+    10-routes.normal.conf      # 切り替えソース: 通常 (すべて backend)
     10-routes.maintenance.conf # 切り替えソース: 全面メンテ (すべて maint Lambda)
 ```
 
@@ -528,7 +528,7 @@ compose/alb/rules/
 
 ```bash
 ./alb-maintenance.sh on      # 全経路をメンテナンス Lambda (503+画面) へ
-./alb-maintenance.sh off     # 通常 (app-back) へ戻す
+./alb-maintenance.sh off     # 通常 (backend) へ戻す
 ./alb-maintenance.sh status  # 現在の状態を表示
 ```
 
@@ -572,10 +572,10 @@ curl -i http://localhost:9080/async/receive -X POST -d '{}'   # これも 503
 | 症状 | 原因・確認ポイント |
 |---|---|
 | `lambda-esm` が `waiting for queue` を繰り返す | `sqs` 未起動、または `elasticmq.conf` の `node-address.host` が `sqs` になっていない |
-| メッセージが消えず何度も再処理される | Lambda が非 2xx を返している (app-back or ALB 到達不可)。`docker logs lambda` を確認 |
-| メッセージが DLQ (`app-async-dlq`) に溜まる | 3 回失敗した。ALB→app-back の経路とサーブレット配備を確認 |
+| メッセージが消えず何度も再処理される | Lambda が非 2xx を返している (backend or ALB 到達不可)。`docker logs lambda` を確認 |
+| メッセージが DLQ (`app-async-dlq`) に溜まる | 3 回失敗した。ALB→backend の経路とサーブレット配備を確認 |
 | ALB で 404 | パス不一致。`BACK_PATH` / `location /async/` / `@WebServlet`+`context-root` を突き合わせる |
-| app-back に POST が届かない | `alb` の `upstream` が `app-back:8180` (port-offset 込み) か確認 |
+| backend に POST が届かない | `alb` の `upstream` が `backend:8180` (port-offset 込み) か確認 |
 | Lambda 直接 invoke が 502 | `handler.py` の例外。`docker logs lambda` にスタックトレースが出る |
 | `/maintenance` が 502 | `alb-lambda-adapter` か `maintenance-lambda` が未起動。`docker logs alb-lambda-adapter` を確認 |
 | メンテナンス画面が崩れる/更新されない | `maintenance.py` 編集後に `docker compose restart maintenance-lambda` を実行したか |

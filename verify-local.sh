@@ -26,11 +26,11 @@ docker compose logs --tail 50 adot-collector | grep -Ei "TracesExporter|spans" |
   echo "WARN: スパン受信ログが見つかりません。アプリのリクエストパスと agent 起動ログを確認してください。"
 
 echo "=== 6. JBoss EAP 側の agent 起動確認 ==="
-docker compose logs app-front  | grep -i "opentelemetry" | head -5 || true
-docker compose logs app-back   | grep -i "opentelemetry" | head -5 || true
+docker compose logs frontend  | grep -i "opentelemetry" | head -5 || true
+docker compose logs backend   | grep -i "opentelemetry" | head -5 || true
 
 echo "=== 7. XA データソースの確認 (front) ==="
-docker compose exec app-front /opt/server/bin/jboss-cli.sh --connect \
+docker compose exec frontend /opt/server/bin/jboss-cli.sh --connect \
   --controller=127.0.0.1:9990 \
   "/subsystem=datasources/xa-data-source=AppXADS:test-connection-in-pool" || \
   echo "WARN: XA 接続テスト失敗。DB_HOST/DB_USER/DB_PASSWORD と MySQL の起動状態を確認。"
@@ -95,14 +95,14 @@ docker compose exec efs-mock stat -c "%n owner=%u:%g mode=%a" /mnt/efs/logs /mnt
   || echo "WARN: efs-mock で権限を確認できません"
 
 echo "=== 12. front/back から偽装 EFS への書き込み確認 ==="
-docker compose exec app-front sh -c \
+docker compose exec frontend sh -c \
   'echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [app-front] verify-local" >> /mnt/logs/app-front.log \
    && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) verify-local" >> /mnt/data/app-front-data.txt' \
-  && echo "app-front → /mnt/logs, /mnt/data: OK" || echo "WARN: app-front から書き込めません"
-docker compose exec app-back sh -c \
+  && echo "frontend → /mnt/logs, /mnt/data: OK" || echo "WARN: frontend から書き込めません"
+docker compose exec backend sh -c \
   'echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [app-back] verify-local" >> /mnt/logs/app-back.log \
    && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) verify-local" >> /mnt/data/app-back-data.txt' \
-  && echo "app-back → /mnt/logs, /mnt/data: OK" || echo "WARN: app-back から書き込めません"
+  && echo "backend → /mnt/logs, /mnt/data: OK" || echo "WARN: backend から書き込めません"
 # 作成されたファイルの所有者確認 (setgid により GID は 6302 になるはず)
 docker compose exec efs-mock ls -ln /mnt/efs/logs /mnt/efs/data || true
 
@@ -154,7 +154,7 @@ rm -f "${CFG_TMP}"
 
 # 偽装 EFS の named volume を front/back/cwagent が共有できているか (同一 volume 名か)
 echo "-- efs-logs volume を参照しているコンテナ --"
-for c in app-front app-back cwagent efs-mock; do
+for c in frontend backend cwagent efs-mock; do
   vols=$(docker inspect "$c" --format '{{range .Mounts}}{{if .Name}}{{.Name}}:{{.Destination}} {{end}}{{end}}' 2>/dev/null || true)
   echo "  ${c}: ${vols:-<取得できず>}"
 done
@@ -279,6 +279,24 @@ else
   fi
 
   echo "詳細: docker compose logs cwagent | grep cwagent-verify"
+fi
+
+echo "=== 15. ALB ターゲットグループのヘルスチェック偽装 (frontend / backend) ==="
+# コンテナ内の healthcheck (=タスク定義の healthCheck) とは別に、ALB がコンテナの外から
+# 投げるヘルスチェックの判定を確認する。詳細は docs/ALB-HEALTHCHECK.md を参照。
+if ! docker compose ps --services 2>/dev/null | grep -qx "alb-healthcheck"; then
+  echo "SKIP: alb-healthcheck サービスが起動していません (docker compose up -d alb-healthcheck)"
+else
+  ALB_HC_STATE=$(curl -s http://localhost:8580/targets 2>/dev/null || true)
+  if [[ -z "${ALB_HC_STATE}" ]]; then
+    echo "WARN: 状態参照 API (http://localhost:8580/targets) から応答がありません"
+  else
+    # 依存を増やさないため、jq ではなく偽装サービス自身のレポート機能で表示する
+    docker compose exec -T alb-healthcheck \
+      python3 /opt/alb-healthcheck/healthcheck.py report --all \
+      && echo "ALB ヘルスチェック判定: OK (全ターゲット healthy)" \
+      || echo "NOTE: 上のレポートで状態・理由コード・ステータスコードを確認してください (initial は起動直後の正常な状態)"
+  fi
 fi
 
 echo ""

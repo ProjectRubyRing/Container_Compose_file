@@ -10,7 +10,7 @@
 # 検証の主眼:
 #   1. secure-api は HTTPS を要求する (平文 HTTP を受け付けない)
 #   2. 自己証明書 cacert.crt を信頼しないクライアントは検証に失敗する (対照実験)
-#   3. app-front / app-back は cacert.crt を JDK と JBoss(Elytron) の両方の
+#   3. frontend / backend は cacert.crt を JDK と JBoss(Elytron) の両方の
 #      トラストストアへ取り込んでいるため、どちらの経路でも REST API 呼び出しに成功する
 #   4. ALB (HTTPS リスナー) 経由でも同じ REST API を呼び出せる
 # =============================================================================
@@ -113,10 +113,10 @@ run_from_host() {
   echo "  (--resolve で 'alb' を 127.0.0.1 に解決させています。証明書の SAN が"
   echo "   DNS:alb のため、localhost で叩くとホスト名不一致になります)"
 
-  echo "--- 6. app-front / app-back の JVM 経路 (ホスト公開ポート経由) ---"
+  echo "--- 6. frontend / backend の JVM 経路 (ホスト公開ポート経由) ---"
   # trust=jdk  … JDK 同梱 cacerts のコピー + cacert.crt (JVM 既定の SSLContext)
   # trust=jboss… JBoss(Elytron) の jboss-truststore.p12 (cacert.crt のみ)
-  for pair in "app-front|http://localhost:8080/tls-probe" "app-back|http://localhost:8180/tls-probe"; do
+  for pair in "frontend|http://localhost:8080/tls-probe" "backend|http://localhost:8180/tls-probe"; do
     name="${pair%%|*}"; base="${pair##*|}"
     for trust in jdk jboss; do
       echo "  [${name}] 直接 (trust=${trust}):"
@@ -155,15 +155,15 @@ fi
 echo ""
 echo "参考:"
 echo "  受領した cacert.crt の投入 : compose/pki/provided/cacert.crt に置いて"
-echo "                               docker compose restart pki-init secure-api alb mysql app-front app-back"
+echo "                               docker compose restart pki-init secure-api alb mysql frontend backend"
 echo "                               (置き場を変える場合は .env の PKI_PROVIDED_DIR)"
 echo "  cacert.crt の出力と配置    : compose/pki/export/ に自動出力される。./pki-export.sh で取り出し/配置"
-echo "                               ビルドへ渡す: docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back"
+echo "                               ビルドへ渡す: docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend"
 echo "                               受領物に固定: ./pki-export.sh --to-provided"
 echo "  どのモードで動いたか       : docker compose logs pki-init | grep 'MODE:'"
 echo "  ALB の証明書を切り替える : ./alb-tls-cert.sh selfsigned | ca-issued | status"
 echo "  証明書を作り直す         : docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot"
-echo "                             (その後 docker compose restart app-front app-back alb secure-api)"
+echo "                             (その後 docker compose restart frontend backend alb secure-api)"
 echo "  トラストストアの中身     : curl -s http://localhost:8080/tls-probe/truststore"
 echo "                             (JDK 側 / JBoss 側の両方が stores.jdk / stores.jboss に出ます)"
 echo "=============================================================="

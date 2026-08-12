@@ -1,0 +1,35 @@
+{
+  "history_limit": 10,
+  "target_groups": [
+    {
+      "name": "tg-frontend",
+      "compose_service": "frontend",
+      "ecs_container": "app-front",
+      "description": "ALB のリスナー (:80 / :443) が最初に流すターゲットグループ。ECS では app-front コンテナの 8080/tcp が登録される。",
+      "protocol": "HTTP",
+      "host": "frontend",
+      "port": 8080,
+      "path": "/",
+      "matcher": "200",
+      "interval_seconds": 30,
+      "timeout_seconds": 5,
+      "healthy_threshold_count": 5,
+      "unhealthy_threshold_count": 2
+    },
+    {
+      "name": "tg-backend",
+      "compose_service": "backend",
+      "ecs_container": "app-back",
+      "description": "ALB のリスナールール (/async/* 等) が流すターゲットグループ。ECS では app-back コンテナの 8180/tcp (port-offset 100) が登録される。",
+      "protocol": "HTTP",
+      "host": "backend",
+      "port": 8180,
+      "path": "/",
+      "matcher": "200",
+      "interval_seconds": 30,
+      "timeout_seconds": 5,
+      "healthy_threshold_count": 5,
+      "unhealthy_threshold_count": 2
+    }
+  ]
+}

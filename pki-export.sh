@@ -22,7 +22,7 @@
 #
 # 【出力した cacert.crt の使い道】
 #   A) イメージのビルドへ build secret として渡す (ベースイメージと同じ方式)
-#        docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+#        docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend
 #        docker build --secret id=cacert,src=compose/pki/export/cacert.crt ...
 #   B) compose/pki/provided/ へ置いて、その CA を受領物として固定する
 #        ./pki-export.sh --to-provided
@@ -181,7 +181,7 @@ if (( TO_PROVIDED )); then
   → 次回以降 pki-init は provided モードになり、この CA を使い続けます。
     反映するには:
       docker compose restart pki-init
-      docker compose restart secure-api alb mysql app-front app-back
+      docker compose restart secure-api alb mysql frontend backend
       docker compose logs pki-init | grep -E 'MODE:|SHA-256'
 EOS
 fi
@@ -205,9 +205,9 @@ cat <<EOS
 
 --------------------------------------------------------------
 次にやること:
-  ビルドへ渡す   : docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+  ビルドへ渡す   : docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend
                    docker compose -f compose.yaml -f compose.build-secret.yaml up -d
-  取り込み確認   : docker compose logs app-front | grep 'truststore\[build\]'
+  取り込み確認   : docker compose logs frontend | grep 'truststore\[build\]'
                    curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha256'
   受領物に固定   : ./pki-export.sh --to-provided
   一括検証       : ./verify-tls.sh

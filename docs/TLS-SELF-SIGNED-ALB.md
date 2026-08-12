@@ -1,7 +1,7 @@
 # 自己証明書 (cacert.crt) による HTTPS 検証 (secure-api / JDK・JBoss トラストストア / ALB)
 
 HTTPS でのみ待ち受ける REST API サーバをテスト用の接続先として用意し、
-**呼び出し元の app-front / app-back が自己証明書 `cacert.crt` を
+**呼び出し元の frontend / backend が自己証明書 `cacert.crt` を
 JDK と JBoss (Elytron) の両方のトラストストアへ取り込むことで、アプリコードを無改変のまま
 REST API を呼び出せる**ことを検証する構成。ALB (HTTPS リスナー) 経由でも同様に検証できる。
 
@@ -34,9 +34,9 @@ JDK 同梱 `cacerts` と JBoss のトラストストアへインポートする�
 >
 > ```bash
 > docker compose up -d pki-init                  # compose/pki/export/cacert.crt が出力される
-> docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+> docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend
 > docker compose -f compose.yaml -f compose.build-secret.yaml up -d
-> docker compose logs app-front | grep 'truststore\[build\]'
+> docker compose logs frontend | grep 'truststore\[build\]'
 >
 > ./pki-export.sh --to-provided                  # この CA を受領物として固定する
 > ./pki-export.sh --to ../base-image/secrets     # ベースイメージのビルドコンテキストへ配置
@@ -67,8 +67,8 @@ JDK 同梱 `cacerts` と JBoss のトラストストアへインポートする�
         │                                │                             │
         ▼                                ▼                             ▼
 ┌────────────────────┐  (C) 直接 HTTPS ┌──────────────┐      ┌────────────────┐
-│  app-front         │ ───────────────▶│  secure-api  │      │  alb (nginx)   │
-│  app-back          │                 │  WireMock    │◀─────│  HTTPS :443    │
+│  frontend         │ ───────────────▶│  secure-api  │      │  alb (nginx)   │
+│  backend          │                 │  WireMock    │◀─────│  HTTPS :443    │
 │  (JBoss EAP)       │ ──(E) ALB 経由─▶ │  HTTPS のみ  │ (B) 再暗号化 (HTTPS)  │
 │                    │                 │  :8443       │      │  HTTP  :80     │
 │ entrypoint が      │                 └──────────────┘      └────────────────┘
@@ -87,7 +87,7 @@ JDK 同梱 `cacerts` と JBoss のトラストストアへインポートする�
 | `pki-init` | 自己証明書 `cacert.crt` (受領物 or 自動発行) と各サーバ証明書を named volume `pki` へ配置。<br>あわせて `cacert.crt` をホストの `compose/pki/export/` へ**出力**する (ビルドへ渡す用) | なし |
 | `secure-api` | **HTTPS でのみ**待ち受ける REST API (WireMock)。★接続確認用のテスト接続先 | `8543:8443` |
 | `alb` | ALB 代替。HTTPS リスナーを追加 (証明書適用) | `9080:80` / **`9443:443`** |
-| `app-front` / `app-back` | `cacert.crt` を JDK / JBoss 両トラストストアへ取り込み、`tls-probe` から HTTPS 呼び出し | `8080` / `8180` |
+| `frontend` / `backend` | `cacert.crt` を JDK / JBoss 両トラストストアへ取り込み、`tls-probe` から HTTPS 呼び出し | `8080` / `8180` |
 | `tls-verifier` | 検証専用コンテナ (`profiles: verify`) | なし |
 
 ---
@@ -264,7 +264,7 @@ PEM 1 枚 (中身の書き換えは一切していない)。
  named volume: pki                compose/pki/export/     ★ホスト側 (今回の追加)
    実行時に front/back/mysql/         │
    alb/secure-api が参照              ├──▶ build secret (id=cacert)
-        │                             │      └─▶ ベースイメージ / app-front / app-back の
+        │                             │      └─▶ ベースイメージ / frontend / backend の
         │                             │           ビルド時に JDK cacerts + jboss-truststore.p12
         ▼                             │           へ keytool で焼き込む
  entrypoint.sh が起動時に             │
@@ -302,8 +302,8 @@ PEM 1 枚 (中身の書き換えは一切していない)。
 docker compose up -d pki-init          # cacert.crt が compose/pki/export/ に出る
 ls compose/pki/export/
 
-# app-front / app-back のビルドへ渡す (オーバーレイで build secret を配線)
-docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+# frontend / backend のビルドへ渡す (オーバーレイで build secret を配線)
+docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend
 docker compose -f compose.yaml -f compose.build-secret.yaml up -d
 
 # 素の docker build で渡す場合 (ベースイメージのビルドはこの形)
@@ -351,8 +351,8 @@ RUN --mount=type=secret,id=cacert,target=/run/secrets/cacert.crt \
 取り込まれたことの確認:
 
 ```bash
-docker compose logs app-front | grep 'truststore\[build\]'
-docker compose exec app-front cat /opt/pki/build-import.txt
+docker compose logs frontend | grep 'truststore\[build\]'
+docker compose exec frontend cat /opt/pki/build-import.txt
 curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha256'
 openssl x509 -in compose/pki/export/cacert.crt -noout -fingerprint -sha256   # ↑と一致するはず
 ```
@@ -367,7 +367,7 @@ openssl x509 -in compose/pki/export/cacert.crt -noout -fingerprint -sha256   # �
 cp compose/pki/export/cacert.crt compose/pki/provided/cacert.crt
 cp compose/pki/export/cacert.key compose/pki/provided/cacert.key   # 鍵も出ていれば
 docker compose restart pki-init
-docker compose restart secure-api alb mysql app-front app-back
+docker compose restart secure-api alb mysql frontend backend
 docker compose logs pki-init | grep -E 'MODE:|SHA-256'
 ```
 
@@ -527,7 +527,7 @@ JDK 側の `trustStoreType` は**あえて指定していない** (JKS / PKCS12 
 
 ## 5. テスト用の接続先 (secure-api)
 
-app-front / app-back が「トラストストアへ取り込んだ `cacert.crt` で接続できるか」を
+frontend / backend が「トラストストアへ取り込んだ `cacert.crt` で接続できるか」を
 確認するための接続先。WireMock を `--disable-http` 付きで起動し、
 **平文 HTTP のポートを一切 listen しない**。
 サーバ証明書は pki-init が配備した PKCS#12 をそのまま渡すため、
@@ -574,7 +574,7 @@ HTTPS リスナーのルーティング (`rules-tls/10-secure-routes.conf`):
 | パス | 転送先 | 実 ALB での相当 |
 |---|---|---|
 | `/secure/*` | `https://secure-api:8443/api/*` | ターゲットグループのプロトコル = **HTTPS** (再暗号化) |
-| `/async/*`, `/` | `http://app-back:8180` | ターゲットグループのプロトコル = HTTP (ALB で TLS 終端) |
+| `/async/*`, `/` | `http://backend:8180` | ターゲットグループのプロトコル = HTTP (ALB で TLS 終端) |
 
 `/secure/*` では `proxy_ssl_verify on` + `proxy_ssl_trusted_certificate /pki/ca/verify-bundle.crt`
 でターゲット証明書も検証している (実 ALB はターゲット証明書を検証しないため、
@@ -795,7 +795,7 @@ curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha2
 ```bash
 cp /path/to/新しい/cacert.crt compose/pki/provided/cacert.crt
 docker compose restart pki-init
-docker compose restart secure-api alb mysql app-front app-back
+docker compose restart secure-api alb mysql frontend backend
 docker compose logs pki-init | grep -E 'MODE:|SHA-256'
 ```
 
@@ -806,7 +806,7 @@ docker compose logs pki-init | grep -E 'MODE:|SHA-256'
 
 ```bash
 docker compose run --rm -e PKI_FORCE_REGENERATE=1 pki-init --oneshot
-docker compose restart secure-api alb app-front app-back
+docker compose restart secure-api alb frontend backend
 ```
 
 front/back は起動のたびに JDK 側 cacerts をコピーし直し、JBoss 側ストアも削除して
@@ -857,16 +857,16 @@ ECS タスク定義へ持ち込む場合の注意:
 | `WARN: export: /export へ書き込めません` | 出力先を `:ro` でマウントしている。`PKI_EXPORT_DIR` に指定したホストパスの書き込み権限も確認する |
 | `docker compose build` が `secret ... no such file or directory` で失敗 | `compose/pki/export/cacert.crt` がまだ無い。先に `docker compose up -d pki-init` (もしくは `./pki-export.sh`) を実行する。`compose.build-secret.yaml` を使うときだけ必要 |
 | build secret を渡したのに取り込まれない | ビルドログに `[build][cacert] ... スキップします` が出ていれば secret が届いていない。`-f compose.build-secret.yaml` を付けているか、`docker build` なら `--secret id=cacert,src=...` の `id` が `cacert` かを確認。BuildKit が無効 (`DOCKER_BUILDKIT=0`) でも渡らない |
-| ビルド時に取り込んだのに実行時の中身が違う | `${PKI_TRUST_DIR}` に `*.crt` があると JBoss 側ストアは毎起動で作り直される (JDK 側は cacerts のコピーなのでビルド時の分も残る)。`docker compose logs app-front \| grep truststore` で両方の経路を確認 |
+| ビルド時に取り込んだのに実行時の中身が違う | `${PKI_TRUST_DIR}` に `*.crt` があると JBoss 側ストアは毎起動で作り直される (JDK 側は cacerts のコピーなのでビルド時の分も残る)。`docker compose logs frontend \| grep truststore` で両方の経路を確認 |
 | 出力物を `provided/` へ置いたら `cacert.key は cacert.crt の秘密鍵ではありません` | 配置先に**古い `cacert.key` が残っている**。`compose/pki/provided/` の鍵を消してから置き直す (`./pki-export.sh --to-provided` は自動で消す) |
 | 受領した `cacert.crt` が使われていない | `docker compose logs pki-init \| grep 'MODE:'` が `generate` なら受領物を認識していない。`compose/pki/provided/cacert.crt` のパス / ファイル名を確認 (`.env` で `PKI_PROVIDED_DIR` を変えている場合はそのパス)。確実に失敗させたいなら `.env` に `PKI_MODE=provided` |
 | `cacert.crt を X.509 証明書として読めません` | 受領物が PEM / DER のどちらでもない (テキスト混入、破損、PKCS#7 / PKCS#12 など)。`openssl x509 -in cacert.crt -noout -text` で確認 |
 | `cacert.key は cacert.crt の秘密鍵ではありません` | 鍵と証明書の取り違え。`openssl x509 -in cacert.crt -noout -pubkey` と `openssl pkey -in cacert.key -pubout` を比較 |
-| 受領物を差し替えたのに反映されない | `pki-init` を再起動していない。`docker compose restart pki-init` 後に `secure-api alb mysql app-front app-back` も再起動する |
-| 項目 7 で「受領物と一致しません」 | トラストストアに別の `cacert` が残っている。`docker compose restart app-front app-back` (entrypoint が毎起動で作り直す)。それでも直らなければ `docker compose logs pki-init \| grep SHA-256` と突き合わせる |
+| 受領物を差し替えたのに反映されない | `pki-init` を再起動していない。`docker compose restart pki-init` 後に `secure-api alb mysql frontend backend` も再起動する |
+| 項目 7 で「受領物と一致しません」 | トラストストアに別の `cacert` が残っている。`docker compose restart frontend backend` (entrypoint が毎起動で作り直す)。それでも直らなければ `docker compose logs pki-init \| grep SHA-256` と突き合わせる |
 | 項目 8 / 9 が `PKIX path building failed` で失敗する (鍵なし受領時) | `PKI_TRUST_LOCAL_CA=0` になっていれば**期待どおり**。正常系も確認したい場合は `1` (既定) に戻すか、`cacert.key` を `compose/pki/provided/` へ置く |
-| `PKIX path building failed` (`trust=jdk`) | JDK 側へ取り込めていない。`curl -s http://localhost:8080/tls-probe/truststore \| jq .stores.jdk` で `hasCacert` を確認。`false` なら `docker compose logs app-front \| grep 'truststore\[jdk\]'` |
-| `PKIX path building failed` (`trust=jboss`) | JBoss 側ストアが空か古い。`docker compose logs app-front \| grep 'truststore\[jboss\]'`。ファイルを作れていない場合は `${JBOSS_HOME}/standalone/configuration` の書き込み権限 (UID 185) を確認 |
+| `PKIX path building failed` (`trust=jdk`) | JDK 側へ取り込めていない。`curl -s http://localhost:8080/tls-probe/truststore \| jq .stores.jdk` で `hasCacert` を確認。`false` なら `docker compose logs frontend \| grep 'truststore\[jdk\]'` |
+| `PKIX path building failed` (`trust=jboss`) | JBoss 側ストアが空か古い。`docker compose logs frontend \| grep 'truststore\[jboss\]'`。ファイルを作れていない場合は `${JBOSS_HOME}/standalone/configuration` の書き込み権限 (UID 185) を確認 |
 | `トラストストアを読めません: .../jboss-truststore.p12` | entrypoint がストアを生成する前に落ちている。`PKI_TRUST_DIR` に `*.crt` があるか確認 |
 | EAP 起動時に `appTrustStore` 関連の WARN | ストアファイルが未生成のまま起動した (`required=false` のため起動自体は成功する)。pki volume のマウントと `depends_on: pki-init` を確認 |
 | `No subject alternative names matching...` | 接続先ホスト名が SAN に無い。`PKI_SECURE_API_SAN` / `PKI_ALB_SAN` へ追加して再生成 |

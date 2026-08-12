@@ -34,7 +34,7 @@ import java.util.Optional;
  * 取り込んだ自己証明書 (cacert.crt) によるサーバ証明書の検証が成功することを
  * 確認する検証用サーブレット。
  *
- * <p>app-front / app-back の <b>両方</b>に同じ WAR を配備しているため、
+ * <p>frontend / backend の <b>両方</b>に同じ WAR を配備しているため、
  * どちらのコンテナからでも同じ URL で確認できる:</p>
  *
  * <pre>

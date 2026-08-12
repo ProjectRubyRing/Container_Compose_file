@@ -69,7 +69,7 @@ RUN "${JBOSS_HOME}/bin/jboss-cli.sh" --file=/tmp/config.cli \
 # 社内標準ベースイメージと同じ方式で、pki-init が出力した cacert.crt を
 # JVM (JDK 同梱 cacerts) と JBoss EAP (Elytron の appTrustStore が参照する
 # jboss-truststore.p12) の両トラストストアへビルド時に焼き込む。
-#   docker compose -f compose.yaml -f compose.build-secret.yaml build app-back
+#   docker compose -f compose.yaml -f compose.build-secret.yaml build backend
 # secret 未指定なら何もしない (従来どおり entrypoint.sh が起動時に取り込む)。
 ARG CACERT_ALIAS=cacert
 ARG JVM_TRUSTSTORE_PASSWORD=changeit

@@ -25,7 +25,7 @@ pki-init (openssl)
    ├──▶ named volume: pki          … 実行時に front/back/mysql/alb/secure-api が参照
    └──▶ compose/pki/export/         … ★ホスト側。docker build へ渡せる
              │
-             ├──▶ build secret (id=cacert) ──▶ ベースイメージ / app-front / app-back のビルド
+             ├──▶ build secret (id=cacert) ──▶ ベースイメージ / frontend / backend のビルド
              └──▶ compose/pki/provided/     ──▶ 次回以降その CA を「受領物」として固定
 ```
 
@@ -54,8 +54,8 @@ pki-init (openssl)
 docker compose up -d pki-init                     # cacert.crt がここへ出力される
 ls compose/pki/export/
 
-# compose のオーバーレイで app-front / app-back のビルドへ渡す
-docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+# compose のオーバーレイで frontend / backend のビルドへ渡す
+docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend
 docker compose -f compose.yaml -f compose.build-secret.yaml up -d
 
 # 素の docker build で渡す場合 (ベースイメージのビルドはこの形)
@@ -66,8 +66,8 @@ docker build --secret id=cacert,src=compose/pki/export/cacert.crt \
 取り込まれたことの確認:
 
 ```bash
-docker compose logs app-front | grep 'truststore\[build\]'
-docker compose exec app-front cat /opt/pki/build-import.txt
+docker compose logs frontend | grep 'truststore\[build\]'
+docker compose exec frontend cat /opt/pki/build-import.txt
 curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha256'
 ```
 
@@ -81,7 +81,7 @@ curl -s http://localhost:8080/tls-probe/truststore | jq -r '.stores[].cacertSha2
 cp compose/pki/export/cacert.crt compose/pki/provided/cacert.crt
 cp compose/pki/export/cacert.key compose/pki/provided/cacert.key   # 鍵も出ていれば
 docker compose restart pki-init
-docker compose restart secure-api alb mysql app-front app-back
+docker compose restart secure-api alb mysql frontend backend
 docker compose logs pki-init | grep -E 'MODE:|SHA-256'
 ```
 

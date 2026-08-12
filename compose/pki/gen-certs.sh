@@ -599,7 +599,7 @@ log "================================================================"
 #      受け取り、JDK の cacerts と JBoss (Elytron) のトラストストアへ取り込む。
 #      ここで出力する cacert.crt は PEM 1 枚なので、その入力にそのまま使える。
 #        docker build --secret id=cacert,src=compose/pki/export/cacert.crt ...
-#        docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+#        docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend
 #      (docker/front/Dockerfile, docker/back/Dockerfile にも同じ取り込みを実装済み)
 #
 #  (2) ★compose/pki/provided/ へそのまま置いて、この CA を受領物として固定する
@@ -670,14 +670,14 @@ export_artifacts() {
     ( cd "${EXPORT_DIR}" && find . -type f ! -name MANIFEST.txt -exec sha256sum {} + | sort -k2 )
     echo ""
     echo "[使い方 1] イメージのビルドへ build secret として渡す"
-    echo "  docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back"
+    echo "  docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend"
     echo "  docker build --secret id=cacert,src=compose/pki/export/cacert.crt -f front/Dockerfile ./docker"
     echo "  (Dockerfile 側: RUN --mount=type=secret,id=cacert,target=/run/secrets/cacert.crt ...)"
     echo ""
     echo "[使い方 2] この CA を受領物として固定する"
     echo "  cp compose/pki/export/cacert.crt compose/pki/provided/cacert.crt"
     echo "  cp compose/pki/export/cacert.key compose/pki/provided/cacert.key   # 鍵も出ていれば"
-    echo "  docker compose restart pki-init secure-api alb mysql app-front app-back"
+    echo "  docker compose restart pki-init secure-api alb mysql frontend backend"
     echo "  (./pki-export.sh --to-provided が上記を代行する)"
     echo ""
     echo "[注意] cacert.key は CA の秘密鍵。持っている人は任意のサーバ証明書を発行できる。"
@@ -691,7 +691,7 @@ export_artifacts() {
   log "    SHA-256 FP : $(fingerprint "${EXPORT_DIR}/cacert.crt")"
   log "    key        : ${EXPORT_KEY_STATE}"
   log "    同梱        : verify-bundle.crt / trust/*.crt / MANIFEST.txt"
-  log "    ビルドへ渡す: docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back"
+  log "    ビルドへ渡す: docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend"
   log "    固定して使う: cp compose/pki/export/cacert.crt compose/pki/provided/cacert.crt"
   log "                  (もしくは ./pki-export.sh --to-provided)"
 }

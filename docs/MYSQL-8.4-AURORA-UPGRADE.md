@@ -1,7 +1,7 @@
 # Aurora MySQL 8.4 / MySQL 8.4.7 化ガイド — 8.0.42 との違いと Connector/J 9.7.0
 
 本ドキュメントは、ローカル compose の DB を **`mysql:8.0.42` から `mysql:8.4.7`** へ、
-JBoss EAP 8.1 (app-front / app-back) の JDBC ドライバを **Connector/J 8.4.0 から 9.7.0** へ
+JBoss EAP 8.1 (frontend / backend) の JDBC ドライバを **Connector/J 8.4.0 から 9.7.0** へ
 更新したことによる、**コンテナの取り扱い**と**接続まわりの差分**を、できるだけ具体的に説明する。
 
 対象読者は、このリポジトリで compose 検証を行う開発者、および ECS/Aurora へ展開する運用担当。
@@ -178,7 +178,7 @@ RUN curl -fsSL -o "${JBOSS_HOME}/modules/com/mysql/main/mysql-connector-j-${MYSQ
 > **ドライバを更新するときの手順**（例: 9.7.0 → 9.8.0）:
 > 1. `module.xml` の `<resource-root path="mysql-connector-j-9.8.0.jar"/>` を書き換える
 > 2. front/back Dockerfile の `ARG MYSQL_CONNECTOR_VERSION=9.8.0` を書き換える
-> 3. `docker compose build --no-cache app-front app-back` で再ビルド
+> 3. `docker compose build --no-cache frontend backend` で再ビルド
 >
 > この 2 ファイルの版数がずれると、`test -f` で**ビルドが失敗**して気付けるようにしてある。
 
@@ -250,7 +250,7 @@ docker compose down
 docker volume rm eap-adot-local_mysql-data 2>/dev/null || true
 
 # 2) DB とアプリを再ビルド起動（Connector/J 9.7.0 が同梱される）
-docker compose up -d --build mysql app-back app-front
+docker compose up -d --build mysql backend frontend
 
 # 3) サーバのバージョンが 8.4.7 か確認
 docker compose exec mysql mysql -uroot -p"localdev-root-change-me" -e "SELECT VERSION();"
@@ -261,8 +261,8 @@ docker compose exec mysql mysql -uroot -p"localdev-root-change-me" \
   -e "SHOW DATABASES; SELECT user,host,plugin FROM mysql.user WHERE user IN ('appuser','infuser');"
 #   → appdb / infdb が存在、plugin は caching_sha2_password
 
-# 5) アプリ（app-front/app-back）が XA データソースで接続できているか
-docker compose logs app-back | grep -i -E "datasource|AppXADS|WFLYJCA"
+# 5) アプリ（frontend/backend）が XA データソースで接続できているか
+docker compose logs backend | grep -i -E "datasource|AppXADS|WFLYJCA"
 #   → AppXADS のバインド成功ログが出ること（Connector/J 9.7.0 経由）
 
 # 6) 既存の総合確認スクリプト

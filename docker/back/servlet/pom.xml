@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   =============================================================================
-  async-receiver — app-back に配備する Java サーブレット WAR
+  async-receiver — backend に配備する Java サーブレット WAR
   ---------------------------------------------------------------------------
   Lambda が ALB 経由で POST してくる先。JBoss EAP 8.1 (Jakarta EE 10) 上で動く。
   この WAR は back/Dockerfile のビルドステージ (maven) 内でビルドされ、

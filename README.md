@@ -8,7 +8,8 @@ ECS/Fargate 本番構成と、AWS に接続せずローカル完結で等価検�
 compose.yaml                         # ローカル検証用 compose (Jaeger を X-Ray の代替 UI に)
 compose.build-secret.yaml            # ★オーバーレイ: cacert.crt を build secret で front/back のビルドへ渡す
 DESIGN.md                            # 設計判断の根拠・デプロイ手順・トラブルシューティング
-docs/ASYNC-SQS-LAMBDA-ALB.md         # 非同期チェーン (SQS→Lambda→ALB→app-back) 詳細ガイド
+docs/ALB-HEALTHCHECK.md              # ALB ターゲットグループのヘルスチェック偽装 (ステータスコード/成功失敗判定) の詳細ガイド
+docs/ASYNC-SQS-LAMBDA-ALB.md         # 非同期チェーン (SQS→Lambda→ALB→backend) 詳細ガイド
 docs/CWAGENT-SSM-CONFIG.md           # CW_CONFIG_CONTENT / CW_CONFIG_CONTENT_MID による設定注入の詳細ガイド
 docs/MYSQL-8.4-AURORA-UPGRADE.md     # Aurora 8.4 / MySQL 8.4.7 化・Connector/J 9.7.0 の詳細解説
 docs/RDS-PROXY-TLS.md                # DB の TLS を RDS Proxy 相当にそろえる設定 / MY-010068 の読み方
@@ -35,12 +36,14 @@ compose/
   cwagent/ssm/*.json                 # Parameter Store に登録する JSON の実体 (主設定 / 追加設定)
   cloudwatch-logs-mock/mappings/     # CloudWatch Logs API の WireMock スタブ (送信の偽装先)
   sqs/elasticmq.conf                 # SQS のローカル代替 (ElasticMQ) キュー/DLQ 設定
-  lambda/app/handler.py              # Lambda 関数 (SQS→ALB→app-back を POST 呼び出し)
+  lambda/app/handler.py              # Lambda 関数 (SQS→ALB→backend を POST 呼び出し)
   lambda-esm/poller.py, Dockerfile   # SQS イベントソースマッピングの代替 (poller)
   alb/nginx.conf                     # ALB のローカル代替 (nginx L7 ルーティング / HTTP:80 + HTTPS:443)
   alb/rules/                         # ALB リスナールール (★差し替え可能★, variants/ に切り替えソース)
   alb/rules-tls/                     # HTTPS リスナーのルール (★差し替え可能★)
   alb/tls/                           # HTTPS リスナーに適用する証明書 (★差し替え可能★, variants/ あり)
+  alb-healthcheck/healthcheck.py     # ALB ターゲットグループのヘルスチェック偽装 (ELB-HealthChecker/2.0)
+  alb-healthcheck/targets.json       # 同 ヘルスチェック設定 (★差し替え可能★, path/matcher/interval/threshold)
   pki/gen-certs.sh, Dockerfile       # 自己署名 PKI 発行 (ルートCA→中間CA→サーバ証明書 / secure-api・ALB・MySQL)
   pki/provided/                      # ★受領した cacert.crt の投入口 (置くと provided モード。git 管理外)
   pki/export/                        # ★配備した cacert.crt の出力口 (build secret の入力 / provided への配置元。git 管理外)
@@ -78,10 +81,10 @@ docker compose up -d --build
 # Jaeger UI: http://localhost:16686
 ```
 
-## 非同期処理チェーン (SQS → Lambda → ALB → app-back)
+## 非同期処理チェーン (SQS → Lambda → ALB → backend)
 
-app-front / app-back から非同期にキューへ積み、SQS → Lambda → ALB を経由して
-app-back の Java サーブレット (`/async/receive`) が POST を受け取るまでを、
+frontend / backend から非同期にキューへ積み、SQS → Lambda → ALB を経由して
+backend の Java サーブレット (`/async/receive`) が POST を受け取るまでを、
 AWS 非接続でローカル再現する。
 
 ```bash
@@ -91,7 +94,7 @@ docker compose up -d --build
 
 - `sqs` (ElasticMQ) が `app-async-queue` / DLQ を提供
 - `lambda-esm` (poller) がキューをポーリングして `lambda` (RIE + `handler.py`) を起動
-- `lambda` が `alb` (nginx) 経由で app-back の `AsyncReceiverServlet` を POST 呼び出し
+- `lambda` が `alb` (nginx) 経由で backend の `AsyncReceiverServlet` を POST 呼び出し
 
 ### メンテナンス画面 Lambda / ALB リスナールール切り替え
 
@@ -101,7 +104,7 @@ ALB のリスナールールからメンテナンス画面 Lambda を呼び出�
 ```bash
 curl -i http://localhost:9080/maintenance   # 常時: メンテナンス画面プレビュー
 ./alb-maintenance.sh on                      # 全面メンテナンス (全経路→503+画面)
-./alb-maintenance.sh off                     # 通常 (app-back) へ戻す
+./alb-maintenance.sh off                     # 通常 (backend) へ戻す
 ```
 
 - `maintenance-lambda` (RIE + `maintenance.py`) が画面 HTML とステータスコードを返す (`maintenance.py` は差し替え可)
@@ -112,6 +115,38 @@ curl -i http://localhost:9080/maintenance   # 常時: メンテナンス画面�
 メンテ Lambda `:9001` / ALB `:9080` / adapter `:9081`
 
 **実装・設定方法の詳細は [docs/ASYNC-SQS-LAMBDA-ALB.md](docs/ASYNC-SQS-LAMBDA-ALB.md) を参照。**
+
+## ALB ターゲットグループのヘルスチェック (frontend / backend)
+
+ECS 構成のヘルスチェックは 2 種類あり、**片方が OK でももう片方は NG になり得る**。
+
+- **コンテナのヘルスチェック** — タスク定義の `healthCheck` (= compose の `healthcheck:`)。
+  コンテナの**中**で `curl -fs http://127.0.0.1:8080/` を実行し、終了コードで判定する
+- **ALB のヘルスチェック** — ターゲットグループの設定。ALB がコンテナの**外**から
+  `GET /` を投げ、**HTTP ステータスコード**が `matcher` に合致するか、
+  連続成功・連続失敗が閾値に達したかで `initial` / `healthy` / `unhealthy` を決める
+
+後者を担うのが `alb-healthcheck` サービス。`frontend` / `backend` へ
+`User-Agent: ELB-HealthChecker/2.0` で定期的に要求を投げ、ALB と同じ規則で判定する
+(`alb` (nginx) は L7 ルーティングだけを担い、ヘルスチェックは含まない)。
+
+```bash
+docker compose logs -f alb-healthcheck              # ALB のアクセスログ相当 (1 行/チェック)
+curl -s http://localhost:8580/targets               # 全ターゲットの設定・状態・履歴 (JSON)
+curl -s http://localhost:8580/targets/frontend      # 1 つ分 (サービス名でも引ける)
+curl -s http://localhost:8580/targets/backend/check # その場で 1 回チェック
+docker compose exec alb-healthcheck \
+  python3 /opt/alb-healthcheck/healthcheck.py report --all   # 人が読む形式のレポート
+```
+
+- ヘルスチェック設定 (`path` / `matcher` / `interval` / `timeout` / 各 `threshold`) は
+  `compose/alb-healthcheck/targets.json` で差し替え可能 (ALB と同名・同意味のキー)
+- 失敗理由は ALB と同じ理由コード (`Target.ResponseCodeMismatch` / `Target.Timeout` /
+  `Target.FailedHealthChecks`) と、`curl -fs` 相当の戻り値で表示する
+- `build_and_verify.sh --keep-container-mode logs` のサービス操作メニューに
+  **ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)** が追加される
+
+**実装・設定方法の詳細は [docs/ALB-HEALTHCHECK.md](docs/ALB-HEALTHCHECK.md) を参照。**
 
 ## 自己証明書 (cacert.crt) による HTTPS 検証 (secure-api / JDK・JBoss トラストストア / ALB)
 
@@ -139,7 +174,7 @@ docker compose logs pki-init | grep 'MODE:'   # provided / generate のどちら
     `tls-verifier` が SHA-256 を突き合わせて「まさにその受領物が取り込まれた」ことまで検証する
   - 受領物を差し替えると SHA-256 の変化を検知して自動で作り直す (`PKI_FORCE_REGENERATE` 不要)
 - `secure-api` (WireMock, `--disable-http`) が **HTTPS でのみ** REST API を提供 (`:8543`)。★接続確認用のテスト接続先
-- `app-front` / `app-back` の entrypoint が `keytool` で `cacert.crt` を **2 か所へ取り込む**
+- `frontend` / `backend` の entrypoint が `keytool` で `cacert.crt` を **2 か所へ取り込む**
   - **JDK**: 同梱 cacerts のコピーへ追加し `-Djavax.net.ssl.trustStore` で JVM に指定 (パブリック CA の信頼は残る)
   - **JBoss**: `jboss-truststore.p12` を生成し、Elytron の `key-store` / `trust-manager` /
     `client-ssl-context` (`docker/cli/elytron-truststore.cli`) が参照する (自己証明書のみの専用ストア)
@@ -187,16 +222,16 @@ docker compose up -d pki-init          # compose/pki/export/cacert.crt が出力
 ls compose/pki/export/                 # cacert.crt / cacert.key / verify-bundle.crt / trust/ / MANIFEST.txt
 
 # 1) イメージのビルドへ build secret で渡す (ベースイメージと同じ方式)
-docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend
 docker compose -f compose.yaml -f compose.build-secret.yaml up -d
-docker compose logs app-front | grep 'truststore\[build\]'      # 取り込み記録
+docker compose logs frontend | grep 'truststore\[build\]'      # 取り込み記録
 
 # 素の docker build で渡す場合
 docker build --secret id=cacert,src=compose/pki/export/cacert.crt -f front/Dockerfile ./docker
 
 # 2) そのまま compose/pki/provided/ へ置いて、この CA を「受領物」として固定する
 ./pki-export.sh --to-provided
-docker compose restart pki-init secure-api alb mysql app-front app-back
+docker compose restart pki-init secure-api alb mysql frontend backend
 
 # ベースイメージのビルドコンテキスト上の所定ディレクトリへ配置する
 ./pki-export.sh --to ../base-image/secrets
@@ -231,7 +266,7 @@ healthcheck 調査と同じ並びで表示される。
 
 ```bash
 cd ../Container_Compose_Build_Push_v2_from_Codex
-./build_and_verify.sh --compose-service app-front,app-back --keep-container-mode logs
+./build_and_verify.sh --compose-service frontend,backend --keep-container-mode logs
 # → Compose サービスを選択 → 「証明書チェック」を選ぶ (追加の入力は不要)
 ```
 

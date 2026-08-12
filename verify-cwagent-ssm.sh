@@ -163,22 +163,22 @@ echo "=== 5. 収集対象のログファイルへマーカーを書き込む ===
 # 主設定は /mnt/logs/app-*.log を、追加設定は /mnt/logs/{front,back}/logs/*.log を見る。
 # 後者はアプリが常時書くとは限らないため、ここで明示的に作って検知させる。
 MARKER="$(date -u +%Y-%m-%dT%H:%M:%SZ) verify-cwagent-ssm"
-docker compose exec -T app-front sh -c \
+docker compose exec -T frontend sh -c \
   "echo '${MARKER} [app-front] default-config' >> /mnt/logs/app-front.log" >/dev/null 2>&1 \
-  && echo "app-front → /mnt/logs/app-front.log: OK" \
-  || warn "app-front から /mnt/logs/app-front.log へ書き込めません"
-docker compose exec -T app-back sh -c \
+  && echo "frontend → /mnt/logs/app-front.log: OK" \
+  || warn "frontend から /mnt/logs/app-front.log へ書き込めません"
+docker compose exec -T backend sh -c \
   "echo '${MARKER} [app-back] default-config' >> /mnt/logs/app-back.log" >/dev/null 2>&1 \
-  && echo "app-back → /mnt/logs/app-back.log: OK" \
-  || warn "app-back から /mnt/logs/app-back.log へ書き込めません"
-docker compose exec -T app-front sh -c \
+  && echo "backend → /mnt/logs/app-back.log: OK" \
+  || warn "backend から /mnt/logs/app-back.log へ書き込めません"
+docker compose exec -T frontend sh -c \
   "mkdir -p /mnt/logs/front/logs && echo '${MARKER} [app-front] mid-config' >> /mnt/logs/front/logs/server.log" >/dev/null 2>&1 \
-  && echo "app-front → /mnt/logs/front/logs/server.log: OK" \
-  || warn "app-front から /mnt/logs/front/logs/ へ書き込めません"
-docker compose exec -T app-back sh -c \
+  && echo "frontend → /mnt/logs/front/logs/server.log: OK" \
+  || warn "frontend から /mnt/logs/front/logs/ へ書き込めません"
+docker compose exec -T backend sh -c \
   "mkdir -p /mnt/logs/back/logs && echo '${MARKER} [app-back] mid-config' >> /mnt/logs/back/logs/server.log" >/dev/null 2>&1 \
-  && echo "app-back → /mnt/logs/back/logs/server.log: OK" \
-  || warn "app-back から /mnt/logs/back/logs/ へ書き込めません"
+  && echo "backend → /mnt/logs/back/logs/server.log: OK" \
+  || warn "backend から /mnt/logs/back/logs/ へ書き込めません"
 
 echo ""
 echo "=== 6. cloudwatch-logs-mock への送信を確認 ==="

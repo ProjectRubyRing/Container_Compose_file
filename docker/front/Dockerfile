@@ -69,7 +69,7 @@ RUN "${JBOSS_HOME}/bin/jboss-cli.sh" --file=/tmp/config.cli \
 # pki-init が出力した cacert.crt (compose/pki/export/cacert.crt) を secret として
 # 渡すと、ここで JVM と JBoss EAP の両トラストストアへ焼き込む。
 #
-#   docker compose -f compose.yaml -f compose.build-secret.yaml build app-front
+#   docker compose -f compose.yaml -f compose.build-secret.yaml build frontend
 #   docker build --secret id=cacert,src=compose/pki/export/cacert.crt -f front/Dockerfile .
 #
 # 取り込み先は entrypoint.sh の実行時取り込みと同じ 2 か所:

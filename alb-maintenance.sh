@@ -3,7 +3,7 @@
 # ALB (nginx) の全面メンテナンスモードを ON/OFF 切り替えする
 # ---------------------------------------------------------------------------
 #   ./alb-maintenance.sh on    → 全リクエストをメンテナンス Lambda (503+画面) へ
-#   ./alb-maintenance.sh off   → 通常モード (app-back へ) に戻す
+#   ./alb-maintenance.sh off   → 通常モード (backend へ) に戻す
 #   ./alb-maintenance.sh status→ 現在の 10-routes.conf の内容を表示
 #
 # 仕組み: compose/alb/rules/variants/ の該当ファイルを
@@ -37,7 +37,7 @@ case "${1:-}" in
     ;;
   off)
     cp "${RULES}/variants/10-routes.normal.conf" "${ACTIVE}"
-    echo "メンテナンスモード: OFF (通常 → app-back)"
+    echo "メンテナンスモード: OFF (通常 → backend)"
     reload_nginx
     ;;
   status)

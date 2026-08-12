@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 非同期処理チェーン (SQS → lambda-esm → Lambda → ALB → app-back) の動作確認
+# 非同期処理チェーン (SQS → lambda-esm → Lambda → ALB → backend) の動作確認
 #   詳細は docs/ASYNC-SQS-LAMBDA-ALB.md を参照
 # =============================================================================
 set -euo pipefail
@@ -13,7 +13,7 @@ ALB_URL="http://localhost:9080"
 LAMBDA_URL="http://localhost:9000/2015-03-31/functions/function/invocations"
 
 echo "=== 1. 関連コンテナの状態確認 ==="
-docker compose ps sqs lambda lambda-esm alb app-back
+docker compose ps sqs lambda lambda-esm alb backend
 
 echo "=== 2. ElasticMQ (SQS) の疎通確認 ==="
 curl -s -o /dev/null -w "elasticmq stats http status: %{http_code}\n" "http://localhost:9325/statistics" || \
@@ -23,18 +23,18 @@ echo "=== 3. ALB (nginx) ヘルスチェック ==="
 curl -s -w " (status: %{http_code})\n" "${ALB_URL}/healthz" || \
   echo "WARN: ALB /healthz に疎通できません"
 
-echo "=== 4. ALB 経由で app-back サーブレットへ直接 POST (Lambda を介さない疎通確認) ==="
+echo "=== 4. ALB 経由で backend サーブレットへ直接 POST (Lambda を介さない疎通確認) ==="
 curl -s -w "\n(status: %{http_code})\n" -X POST "${ALB_URL}/async/receive" \
   -H 'Content-Type: application/json' \
   -d '{"probe":"via-alb-direct"}' || \
-  echo "WARN: ALB→app-back の直接 POST に失敗"
+  echo "WARN: ALB→backend の直接 POST に失敗"
 
 echo "=== 5. Lambda を直接 invoke (RIE。SQS を介さない疎通確認) ==="
 curl -s -w "\n(status: %{http_code})\n" -X POST "${LAMBDA_URL}" \
   -d '{"Records":[{"messageId":"probe-1","body":"{\"probe\":\"direct-invoke\"}"}]}' || \
   echo "WARN: Lambda 直接 invoke に失敗"
 
-echo "=== 6. SQS にメッセージを投入 (プロデューサ = app-front/app-back 相当) ==="
+echo "=== 6. SQS にメッセージを投入 (プロデューサ = frontend/backend 相当) ==="
 BODY='{"orderId":"A-1001","action":"createReport","ts":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}'
 if command -v aws >/dev/null 2>&1; then
   aws --endpoint-url "${SQS_URL}" --region ap-northeast-1 sqs send-message \
@@ -49,7 +49,7 @@ else
     --data-urlencode "MessageBody=${BODY}"
 fi
 
-echo "=== 7. poller → Lambda → ALB → app-back の伝搬を待機 (最大 25s) ==="
+echo "=== 7. poller → Lambda → ALB → backend の伝搬を待機 (最大 25s) ==="
 sleep 5
 docker compose logs --tail 10 lambda-esm | grep -Ei "received|invoking|deleted" || \
   echo "NOTE: lambda-esm のログにまだ受信記録がありません"
@@ -62,9 +62,9 @@ echo "=== 9. ALB のアクセスログに /async/receive があるか ==="
 docker compose logs --tail 20 alb | grep -Ei "/async/receive" || \
   echo "NOTE: ALB に /async/receive の記録がありません"
 
-echo "=== 10. app-back の Java サーブレットが受信したか ==="
-docker compose logs --tail 30 app-back | grep -Ei "async-receiver" | tail -5 || \
-  echo "NOTE: app-back に async-receiver の受信ログがありません"
+echo "=== 10. backend の Java サーブレットが受信したか ==="
+docker compose logs --tail 30 backend | grep -Ei "async-receiver" | tail -5 || \
+  echo "NOTE: backend に async-receiver の受信ログがありません"
 
 echo "=== 11. 正常処理されたメッセージがキューから消えたか ==="
 sleep 3
@@ -103,6 +103,6 @@ curl -s -o /dev/null -D - "${ALB_URL}/maintenance" \
 
 echo ""
 echo "完了:"
-echo "  - 上記 10 で app-back のサーブレットが body を受信していれば非同期 E2E 成功。"
+echo "  - 上記 10 で backend のサーブレットが body を受信していれば非同期 E2E 成功。"
 echo "  - 上記 14 で 503 + X-Maintenance ヘッダが返れば メンテナンス Lambda 経路 成功。"
 echo "  - 全面メンテナンス切り替えは ./alb-maintenance.sh on|off で確認できます。"

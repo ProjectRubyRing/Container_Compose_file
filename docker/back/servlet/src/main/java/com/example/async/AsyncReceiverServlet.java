@@ -18,13 +18,13 @@ import java.time.OffsetDateTime;
 /**
  * async-receiver — 非同期処理チェーンの終端。
  *
- * <p>経路: app-front/app-back → SQS(ElasticMQ) → lambda-esm(poller) → Lambda(handler.py)
+ * <p>経路: frontend/backend → SQS(ElasticMQ) → lambda-esm(poller) → Lambda(handler.py)
  *          → ALB(nginx) → <b>このサーブレット</b>。</p>
  *
  * <p>URL: コンテキストルート {@code /async} (jboss-web.xml) + マッピング {@code /receive}
  *          = <b>/async/receive</b>。ALB のリスナールール {@code /async/*} がここへ転送する。</p>
  *
- * <p>受信した POST ボディを標準出力 (docker logs app-back) と、書き込み可能なら
+ * <p>受信した POST ボディを標準出力 (docker logs backend) と、書き込み可能なら
  *    /mnt/logs/app-back-async.log (偽装 EFS → cwagent が拾う) に記録し、200 を返す。</p>
  */
 @WebServlet(name = "AsyncReceiverServlet", urlPatterns = {"/receive"})
@@ -54,7 +54,7 @@ public class AsyncReceiverServlet extends HttpServlet {
                 body.getBytes(StandardCharsets.UTF_8).length,
                 body.replace('\n', ' '));
 
-        // CloudWatch Logs 相当 (docker logs app-back で確認)
+        // CloudWatch Logs 相当 (docker logs backend で確認)
         System.out.println(logLine);
 
         // 偽装 EFS に追記 (書けない環境ではスキップ)。cwagent がこのファイルも拾える。

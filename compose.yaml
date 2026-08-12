@@ -2,7 +2,14 @@
 # ローカル検証用 Compose 構成 (AWS 実サービスには一切接続しない)
 #
 # ECS 構成との対応:
-#   app-front / app-back      → 同一 Dockerfile・同一 entrypoint (完全に同じイメージ)
+#   frontend / backend        → ECS タスクの app-front / app-back コンテナに対応する。
+#                               同一 Dockerfile・同一 entrypoint (完全に同じイメージ)。
+#                               ECS 側のコンテナ名・ロググループ・EFS 上のログファイル名は
+#                               app-front / app-back のまま (ecs/taskdef.json と一致させる)
+#   alb-healthcheck           → ALB ターゲットグループのヘルスチェックの代替。
+#                               frontend / backend を ELB-HealthChecker/2.0 として定期的に
+#                               呼び、ステータスコードと matcher 判定・連続回数から
+#                               initial / healthy / unhealthy を導出する
 #   adot-collector            → 同じ ADOT Collector イメージ。exporter だけ
 #                               awsxray → debug + otlphttp(Jaeger) に差し替え
 #   jaeger                    → X-Ray コンソールの代替 (トレース可視化 UI)
@@ -53,13 +60,13 @@
 name: eap-adot-local
 
 services:
-  app-front:
+  frontend:
     build:
       context: ./docker
       dockerfile: front/Dockerfile
       args:
         EAP_BASE_IMAGE: ${EAP_BASE_IMAGE:?set in .env}
-    container_name: app-front
+    container_name: frontend
     ports:
       - "8080:8080"
     environment:
@@ -80,7 +87,7 @@ services:
       DB_SSL_MODE: VERIFY_IDENTITY
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
-      BACK_BASE_URL: http://app-back:8180
+      BACK_BASE_URL: http://backend:8180
       # 非同期処理用 SQS (ElasticMQ) のローカルエンドポイント。
       # 実 AWS では SDK が IAM ロールとリージョンから解決するが、ローカルでは明示する。
       ASYNC_SQS_ENDPOINT: http://sqs:9324
@@ -121,10 +128,10 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      # app-back は起動開始のみを待つ。EAP の起動完了 (healthy) まで待つ場合は
+      # backend は起動開始のみを待つ。EAP の起動完了 (healthy) まで待つ場合は
       # service_healthy に変更するが、back の start_period が 120s のため
       # front の起動開始が 2〜3 分遅れる点に注意する。
-      app-back:
+      backend:
         condition: service_started
       # WireMock は JVM 起動のため、コンテナ起動から HTTP listen 開始まで数秒〜数十秒かかる。
       # service_started だと listen 前に EAP と ADOT Java Agent が
@@ -144,13 +151,13 @@ services:
       retries: 3
       start_period: 120s
 
-  app-back:
+  backend:
     build:
       context: ./docker
       dockerfile: back/Dockerfile
       args:
         EAP_BASE_IMAGE: ${EAP_BASE_IMAGE:?set in .env}
-    container_name: app-back
+    container_name: backend
     ports:
       - "8180:8180"
     environment:
@@ -373,7 +380,7 @@ services:
     ports:
       - "8380:8080"  # 例: curl http://localhost:8380/v4/158d1c8083dd49d6b527399fd6414f5c-1234567890/task
     healthcheck:
-      # app-front / app-back / adot-collector がこのモックを起動時に参照するため、
+      # frontend / backend / adot-collector がこのモックを起動時に参照するため、
       # HTTP listen 開始を healthy 条件にして依存側を service_healthy で待たせる。
       test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8080' || exit 1"]
       interval: 3s
@@ -588,17 +595,17 @@ services:
       start_period: 5s
 
   # ===========================================================================
-  # 非同期処理チェーン (SQS → Lambda → ALB → app-back)
+  # 非同期処理チェーン (SQS → Lambda → ALB → backend)
   # ---------------------------------------------------------------------------
-  #   app-front / app-back        → SQS(app-async-queue) にメッセージを積む (プロデューサ)
+  #   frontend / backend        → SQS(app-async-queue) にメッセージを積む (プロデューサ)
   #   sqs (ElasticMQ)             → Amazon SQS のローカル代替 (キュー本体)
   #   lambda-esm (poller.py)      → SQS イベントソースマッピングの代替。キューを
   #                                 ロングポーリングし Lambda を HTTP invoke する
   #   lambda (RIE + handler.py)   → AWS Lambda ランタイムのローカル代替。SQS イベントを
-  #                                 受け、ALB 経由で app-back を POST 呼び出しする
+  #                                 受け、ALB 経由で backend を POST 呼び出しする
   #   alb (nginx)                 → Application Load Balancer のローカル代替 (L7 ルーティング)
-  #                                 /async/* を app-back:8180 のサーブレットへ転送する
-  #   app-back の /async/receive  → Java サーブレット (async-receiver.war) が POST を受信
+  #                                 /async/* を backend:8180 のサーブレットへ転送する
+  #   backend の /async/receive  → Java サーブレット (async-receiver.war) が POST を受信
   #
   # 詳細な仕組み・設定方法は docs/ASYNC-SQS-LAMBDA-ALB.md を参照。
   # ===========================================================================
@@ -660,7 +667,7 @@ services:
         condition: service_started
 
   # --- Application Load Balancer のローカル代替 (nginx) -----------------------
-  # /async/*      → app-back:8180 のサーブレット (ターゲットグループ)
+  # /async/*      → backend:8180 のサーブレット (ターゲットグループ)
   # /maintenance* → メンテナンス Lambda (alb-lambda-adapter 経由の Lambda ターゲット)
   # リスナールールは compose/alb/rules/*.conf に分離 (★差し替え可能★)。
   # 全面メンテナンス ON/OFF は ./alb-maintenance.sh on|off で切り替える。
@@ -678,7 +685,7 @@ services:
       - "9080:80"    # ホストから ALB 経由の疎通確認用 (http://localhost:9080/async/receive)
       - "9443:443"   # HTTPS リスナー (https://localhost:9443/secure/v1/ping)
     depends_on:
-      app-back:
+      backend:
         condition: service_started
       alb-lambda-adapter:
         condition: service_started
@@ -695,15 +702,72 @@ services:
       retries: 5
       start_period: 5s
 
+  # --- ALB ターゲットグループのヘルスチェックのローカル代替 --------------------
+  # 上の alb (nginx) が担うのは L7 ルーティングだけで、ALB のもう一つの仕事である
+  # 「ターゲットグループのヘルスチェック」は含まれない。このサービスがそれを担う。
+  #
+  # 実 AWS: ALB が ECS タスク (app-front:8080 / app-back:8180) へ★タスクの外から★
+  #         定期的に GET を投げ、ステータスコードが matcher に合致するかと、
+  #         連続成功 / 連続失敗の回数から initial / healthy / unhealthy を導出する。
+  #         unhealthy になると ALB はルーティングを止め、ECS はタスクを置き換える。
+  # ここでは: frontend / backend へ同じ要求 (User-Agent: ELB-HealthChecker/2.0) を投げ、
+  #         同じ閾値ルールで状態を導出する。compose の healthcheck:
+  #         (= タスク定義の healthCheck。コンテナ内で curl を実行する) とは別物。
+  #
+  # ★ヘルスチェック設定の差し替えは compose/alb-healthcheck/targets.json
+  #   (path / matcher / interval / timeout / 各 threshold は ALB と同じ項目)。
+  #
+  # 確認方法:
+  #   curl -s http://localhost:8580/targets            # 全ターゲットグループの状態
+  #   curl -s http://localhost:8580/targets/frontend   # 1 つ分 (サービス名でも引ける)
+  #   curl -s http://localhost:8580/targets/backend/check  # その場で 1 回チェック
+  #   docker compose logs -f alb-healthcheck           # ALB のアクセスログ相当
+  #   docker compose exec alb-healthcheck \
+  #     python3 /opt/alb-healthcheck/healthcheck.py report --all
+  # 詳細は docs/ALB-HEALTHCHECK.md / compose/alb-healthcheck/README.md を参照。
+  alb-healthcheck:
+    image: python:3.12-slim
+    container_name: alb-healthcheck
+    command: ["python3", "/opt/alb-healthcheck/healthcheck.py", "serve"]
+    environment:
+      # ターゲット定義 (★差し替え可能★) とリスンポート。どちらもコンテナ内パス。
+      ALB_HEALTHCHECK_TARGETS_FILE: /etc/alb-healthcheck/targets.json
+      ALB_HEALTHCHECK_LISTEN_PORT: "8080"
+      # 保持する定期チェック履歴の件数 (レポートの「履歴」に出る件数)
+      ALB_HEALTHCHECK_HISTORY_LIMIT: "10"
+      # 偽装サービスのコンテナ内 CLI の場所。build_and_verify.sh の
+      # 「ALB ヘルスチェック確認」メニューがこの値を見て docker exec する。
+      ALB_HEALTHCHECK_CLI: /opt/alb-healthcheck/healthcheck.py
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./compose/alb-healthcheck/healthcheck.py:/opt/alb-healthcheck/healthcheck.py:ro
+      - ./compose/alb-healthcheck/targets.json:/etc/alb-healthcheck/targets.json:ro
+    ports:
+      - "8580:8080"   # 状態参照 API (http://localhost:8580/targets)
+    # ALB は「ターゲット登録直後から initial のままチェックを始める」ため、
+    # ターゲットの healthy は待たない (待つと initial → healthy の遷移が見えない)。
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_started
+    healthcheck:
+      # 偽装サービス自身が生きているか (ターゲットの健全性とは無関係)
+      test: ["CMD-SHELL", "python3 /opt/alb-healthcheck/healthcheck.py ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   # ===========================================================================
   # 自己証明書 (cacert.crt) による HTTPS 検証 (pki-init / secure-api / tls-verifier)
   # ---------------------------------------------------------------------------
   #   pki-init      → 自己署名 CA (cacert.crt) と各サーバ証明書を発行し
   #                   named volume (pki) で全コンテナへ配る
   #   secure-api    → HTTPS でのみ待ち受ける REST API サーバ (WireMock)。
-  #                   ★app-front / app-back の接続確認用テスト接続先。
+  #                   ★frontend / backend の接続確認用テスト接続先。
   #                   cacert.crt が発行したサーバ証明書だけを提示する
-  #   app-front/back→ entrypoint が cacert.crt を JDK と JBoss(Elytron) の
+  #   frontend/back  → entrypoint が cacert.crt を JDK と JBoss(Elytron) の
   #                   両トラストストアへ取り込み、その両方で接続確認する
   #   alb           → HTTPS リスナー (:443) に証明書を適用し /secure/* を
   #                   secure-api へ HTTPS で再暗号化して転送
@@ -731,8 +795,8 @@ services:
   #
   # ★配備した cacert.crt はホストの compose/pki/export/ にも出力される (PKI_EXPORT_DIR)
   #   named volume の中身は docker build から見えないため、ベースイメージ /
-  #   app-front / app-back のビルドへ build secret で渡すにはホスト側のファイルが要る。
-  #     ビルドへ渡す : docker compose -f compose.yaml -f compose.build-secret.yaml build app-front app-back
+  #   frontend / backend のビルドへ build secret で渡すにはホスト側のファイルが要る。
+  #     ビルドへ渡す : docker compose -f compose.yaml -f compose.build-secret.yaml build frontend backend
   #     受領物に固定 : ./pki-export.sh --to-provided
   #                    (compose/pki/export/cacert.crt をそのまま provided/ へ置くのと同じ)
   #
@@ -799,7 +863,7 @@ services:
       start_period: 2s
 
   # --- HTTPS を要求する REST API サーバ (★テスト用の接続先) ------------------
-  # app-front / app-back が「JDK / JBoss のトラストストアへ取り込んだ自己証明書
+  # frontend / backend が「JDK / JBoss のトラストストアへ取り込んだ自己証明書
   # cacert.crt を使って接続できるか」を確認するための接続先。
   # WireMock を HTTPS 専用 (--disable-http) で起動する。
   # サーバ証明書は pki-init が cacert.crt で発行したものを PKCS#12 で渡すため、
@@ -862,8 +926,8 @@ services:
       SECURE_API_PORT: "8443"
       ALB_HOST: alb
       ALB_HTTPS_PORT: "443"
-      FRONT_PROBE: http://app-front:8080/tls-probe
-      BACK_PROBE: http://app-back:8180/tls-probe
+      FRONT_PROBE: http://frontend:8080/tls-probe
+      BACK_PROBE: http://backend:8180/tls-probe
       WAIT_SECONDS: "180"
     volumes:
       - pki:/pki:ro

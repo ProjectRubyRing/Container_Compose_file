@@ -22,7 +22,7 @@ compose/pki/provided/
 ```bash
 docker compose up -d pki-init          # 未起動なら
 docker compose restart pki-init        # すでに起動している場合
-docker compose restart secure-api alb mysql app-front app-back
+docker compose restart secure-api alb mysql frontend backend
 docker compose logs pki-init           # ★どのモードで動いたかを必ず確認する
 ```
 
@@ -47,7 +47,7 @@ PKI_PROVIDED_DIR=/c/secure/certs/received
 
 ```bash
 ./pki-export.sh --to-provided        # export/ の cacert.crt (+key) をここへ配置
-docker compose restart pki-init secure-api alb mysql app-front app-back
+docker compose restart pki-init secure-api alb mysql frontend backend
 ```
 
 `cacert.key` も一緒に置けば下表の (A)、`cacert.crt` だけなら (B) になります。

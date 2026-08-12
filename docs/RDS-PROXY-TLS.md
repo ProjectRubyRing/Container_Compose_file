@@ -1,6 +1,6 @@
 # MySQL の TLS 挙動を RDS Proxy にそろえる — MY-010068 / MY-013602 の読み方
 
-app-front / app-back (JBoss EAP 8.1) から `mysql:8.4.7` へ接続したときに出る
+frontend / backend (JBoss EAP 8.1) から `mysql:8.4.7` へ接続したときに出る
 
 ```
 [Warning] [MY-010068] [Server] CA certificate ca.pem is self signed.
@@ -64,7 +64,7 @@ mysqld は起動時、`ssl_ca` に指定された CA 証明書の issuer と sub
 
 ## 2. RDS Proxy 経由ではどうなるか
 
-本番の経路は `app-front / app-back → RDS Proxy → Aurora MySQL 8.4` で、
+本番の経路は `frontend / backend → RDS Proxy → Aurora MySQL 8.4` で、
 アプリが TLS ハンドシェイクする相手は **Aurora ではなく RDS Proxy** になる。
 
 | 観点 | ローカル `mysql:8.4.7` (変更前) | RDS Proxy |
@@ -264,7 +264,7 @@ docker compose exec mysql mysql -uroot -p"localdev-root-change-me" -e \
     WHERE PROCESSLIST_USER IS NOT NULL GROUP BY 1,2;"
 
 # 8) EAP 側から XA 接続テスト
-docker compose exec app-front /opt/server/bin/jboss-cli.sh --connect \
+docker compose exec frontend /opt/server/bin/jboss-cli.sh --connect \
   --controller=127.0.0.1:9990 \
   "/subsystem=datasources/xa-data-source=AppXADS:test-connection-in-pool"
 ```

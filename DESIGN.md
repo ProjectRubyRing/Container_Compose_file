@@ -30,7 +30,8 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 
 | ECS | compose | 等価性の担保 |
 |---|---|---|
-| app-front / app-back | 同じ | 同一 Dockerfile・同一 entrypoint・同一イメージ |
+| app-front / app-back (コンテナ名) | frontend / backend (compose サービス名) | 同一 Dockerfile・同一 entrypoint・同一イメージ。compose 側だけ役割が分かる名前にしてあり、ECS 側の識別子 (コンテナ名・ロググループ `/ecs/.../app-front`・偽装 EFS 上の `app-front*.log`) は taskdef と一致させたまま据え置く |
+| ALB ターゲットグループのヘルスチェック | alb-healthcheck (ELB-HealthChecker/2.0 の偽装) | `interval` / `timeout` / `matcher` / `healthy・unhealthy threshold` と `initial → healthy / unhealthy` の遷移まで ALB と同じ規則で判定する。詳細は [docs/ALB-HEALTHCHECK.md](docs/ALB-HEALTHCHECK.md) |
 | adot-collector (awsxray) | adot-collector (debug + otlphttp/jaeger) | 同一イメージ・receiver/processor 同一、exporter のみ差し替え |
 | X-Ray コンソール | Jaeger UI (:16686) | トレース可視化の代替 |
 | Aurora MySQL 8.4 + RDS Proxy | mysql:8.4.7 | XA_RECOVER_ADMIN を init.sql で付与。Connector/J 9.7.0 (静的モジュール)。TLS は pki-init 発行の CA 発行証明書 + 平文拒否で RDS Proxy 相当にそろえ、本番と同じ `sslMode=VERIFY_IDENTITY` で検証する。詳細は [docs/MYSQL-8.4-AURORA-UPGRADE.md](docs/MYSQL-8.4-AURORA-UPGRADE.md) / [docs/RDS-PROXY-TLS.md](docs/RDS-PROXY-TLS.md) |
@@ -312,7 +313,7 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
 姉妹リポジトリの `Container_Compose_Build_Push_v2_from_Codex/build_and_verify.sh` を
 `--keep-container-mode logs` で起動すると、操作メニューに**証明書チェック**が出る
 (表示条件はコンテナ内に `curl` + `keytool` があり、JVM トラストストアと `https://`
-環境変数の両方を持つこと。app-front / app-back が該当し、mysql 等には出ない)。
+環境変数の両方を持つこと。frontend / backend が該当し、mysql 等には出ない)。
 選択後の入力は不要で、次を自動検出して一度に回す。
 
 | 検出対象 | 検出元 |
@@ -334,6 +335,33 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
 - **対照テスト (`--cacert` 無し) が `[WARN]` で成功** → 宛先がパブリック CA でも検証できており、
   自己証明書の取り込みを検証できていない。`cacert.crt` の配布経路を疑う
 
+### ALB ヘルスチェック関連 (frontend / backend)
+
+ヘルスチェックは 2 系統あり、**どちらの話をしているか**を先に区別する。
+
+| | 定義 | 実行場所 | 判定材料 |
+|---|---|---|---|
+| コンテナ | タスク定義の `healthCheck` (= compose の `healthcheck:`) | コンテナの中 | コマンドの終了コード |
+| ALB | ターゲットグループのヘルスチェック設定 | コンテナの外 (`alb-healthcheck` が代替) | HTTP ステータスコードと連続回数 |
+
+ローカルでは `alb-healthcheck` サービスが後者を `ELB-HealthChecker/2.0` として再現し、
+`initial` / `healthy` / `unhealthy` と ALB と同じ理由コードを導出する。
+`build_and_verify.sh --keep-container-mode logs` の操作メニューには
+**ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)** が出る
+(表示条件は `alb-healthcheck` が起動しており、選んだサービスが `targets.json` の
+ターゲットであること。`frontend` / `backend` と偽装サービス自身が該当する)。
+
+| 症状 | 原因と対処 |
+|---|---|
+| コンテナは `healthy` なのに ALB では `unhealthy` | ALB の `path` / `matcher` が実際の応答と合っていない。`docker compose logs alb-healthcheck` の `status=` を見て `compose/alb-healthcheck/targets.json` を直す (例: ルートが 302 を返すなら `matcher` を `200-399` に) |
+| いつまでも `initial` | `healthy_threshold_count` 回の連続成功に達していない (既定 5 回 × 30 秒 = 最短 150 秒)。ALB も同じ挙動 |
+| `unhealthy` から戻らない | 復帰にも**連続成功**が必要。ログの `streak=success:n/failure:m` で連続回数を確認する |
+| 戻り値 `28` / `Target.Timeout` が続く | 応答が `timeout_seconds` より遅い。EAP 起動途中ならそのまま待つ (ALB 側に `start_period` 相当の設定はなく、本番は ECS サービスの health check grace period で吸収する) |
+| 戻り値 `6` / `7` | 名前解決・接続の問題でヘルスチェック設定は無関係。ターゲットの起動状態と compose ネットワークを見る |
+| メニューに項目が出ない | `alb-healthcheck` が起動していない (`docker compose up -d alb-healthcheck`)、または選んだサービスが `targets.json` のターゲットに無い |
+
+詳細は [docs/ALB-HEALTHCHECK.md](docs/ALB-HEALTHCHECK.md) を参照。
+
 ### cacert.crt の出力 (export) / build secret 関連
 
 | 症状 | 原因と対処 |
@@ -342,7 +370,7 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
 | `docker compose build` が `secret ... no such file or directory` | `compose/pki/export/cacert.crt` が未出力。先に `docker compose up -d pki-init`。このエラーは `-f compose.build-secret.yaml` を付けたときだけ起きる |
 | ビルドログに `[build][cacert] ... スキップします` | secret が届いていない。`-f compose.build-secret.yaml` の指定、`docker build` なら `--secret id=cacert,src=...` の `id`、BuildKit の有効化 (`DOCKER_BUILDKIT=1`) を確認 |
 | 出力物を `provided/` へ置いたら `cacert.key は cacert.crt の秘密鍵ではありません` で pki-init が落ちる | 配置先に古い `cacert.key` が残っている。消してから置き直す (`./pki-export.sh --to-provided` は自動で消す) |
-| ビルド時に焼き込んだ証明書と実行時の中身が違う | `PKI_TRUST_DIR` に `*.crt` があると JBoss 側ストアは毎起動で作り直される。`docker compose logs app-front \| grep truststore` で `[build]` と `[jboss]` の両方を確認する |
+| ビルド時に焼き込んだ証明書と実行時の中身が違う | `PKI_TRUST_DIR` に `*.crt` があると JBoss 側ストアは毎起動で作り直される。`docker compose logs frontend \| grep truststore` で `[build]` と `[jboss]` の両方を確認する |
 
 ### SSM / タスク起動関連
 
