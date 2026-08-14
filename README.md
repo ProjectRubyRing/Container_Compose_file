@@ -9,6 +9,7 @@ compose.yaml                         # ローカル検証用 compose (Jaeger を
 compose.build-secret.yaml            # ★オーバーレイ: cacert.crt を build secret で front/back のビルドへ渡す
 DESIGN.md                            # 設計判断の根拠・デプロイ手順・トラブルシューティング
 docs/ALB-HEALTHCHECK.md              # ALB ターゲットグループのヘルスチェック偽装 (ステータスコード/成功失敗判定) の詳細ガイド
+docs/ECS-EXEC.md                     # ECS Exec 偽装 (aws ecs execute-command / ファイル投入) の詳細ガイド
 docs/ASYNC-SQS-LAMBDA-ALB.md         # 非同期チェーン (SQS→Lambda→ALB→backend) 詳細ガイド
 docs/CWAGENT-SSM-CONFIG.md           # CW_CONFIG_CONTENT / CW_CONFIG_CONTENT_MID による設定注入の詳細ガイド
 docs/MYSQL-8.4-AURORA-UPGRADE.md     # Aurora 8.4 / MySQL 8.4.7 化・Connector/J 9.7.0 の詳細解説
@@ -21,6 +22,7 @@ verify-local.sh                      # ローカル動作確認スクリプト
 verify-async.sh                      # 非同期チェーンの動作確認スクリプト
 verify-tls.sh                        # 自己署名証明書 HTTPS 経路の動作確認スクリプト
 verify-cwagent-ssm.sh                # cwagent の SSM (SecureString) 設定注入の動作確認スクリプト
+verify-ecs-exec.sh                   # ECS Exec 偽装 (接続・コマンド実行・ファイル往復・失敗系) の動作確認スクリプト
 alb-maintenance.sh                   # ALB 全面メンテナンスモードの ON/OFF 切り替え
 alb-tls-cert.sh                      # ALB HTTPS リスナーの証明書切り替え (自己署名 / 中間CA発行)
 pki-export.sh                        # ★配備した cacert.crt の取り出しと配置 (build secret 用 / provided へ固定)
@@ -44,6 +46,10 @@ compose/
   alb/tls/                           # HTTPS リスナーに適用する証明書 (★差し替え可能★, variants/ あり)
   alb-healthcheck/healthcheck.py     # ALB ターゲットグループのヘルスチェック偽装 (ELB-HealthChecker/2.0)
   alb-healthcheck/targets.json       # 同 ヘルスチェック設定 (★差し替え可能★, path/matcher/interval/threshold)
+  ecs-exec/ecs-exec.py, Dockerfile   # ECS Exec 偽装 (aws ecs execute-command 互換 + ファイル投入/取り出し)
+  ecs-exec/tasks.json                # 同 接続先定義 (★差し替え可能★, ECS コンテナ名 → compose サービス)
+  ecs-exec/files/                    # ★ホスト ⇔ コンテナのファイル受け渡し場所 (コンテナ内 /work。git 管理外)
+  ecs-exec/sessions/                 # 同 セッションログの出力先 (実 ECS Exec のログ保管相当。git 管理外)
   pki/gen-certs.sh, Dockerfile       # 自己署名 PKI 発行 (ルートCA→中間CA→サーバ証明書 / secure-api・ALB・MySQL)
   pki/provided/                      # ★受領した cacert.crt の投入口 (置くと provided モード。git 管理外)
   pki/export/                        # ★配備した cacert.crt の出力口 (build secret の入力 / provided への配置元。git 管理外)
@@ -147,6 +153,60 @@ docker compose exec alb-healthcheck \
   **ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)** が追加される
 
 **実装・設定方法の詳細は [docs/ALB-HEALTHCHECK.md](docs/ALB-HEALTHCHECK.md) を参照。**
+
+## ECS Exec の偽装 (frontend / backend の中へ入る・ファイルを送り込む)
+
+実 AWS で「動いているタスクの中へ入る」手段が ECS Exec
+(`aws ecs execute-command`)。`ecs-exec` サービスはその**コマンド体系と失敗の出方**を
+そのままローカルへ持ち込む (チャネルの実体は SSM ではなく `docker exec`)。
+
+```bash
+# 接続先の一覧 (ECS のコンテナ名 ⇄ compose サービス) とコマンド例
+docker compose exec ecs-exec ecs-exec tasks
+
+# ★実 AWS とまったく同じ書き方で frontend (app-front) の中へ入る
+docker compose exec ecs-exec \
+  aws ecs execute-command \
+    --cluster myapp-local-cluster \
+    --task 158d1c8083dd49d6b527399fd6414f5c \
+    --container app-front \
+    --interactive \
+    --command "/bin/bash"
+
+# backend (app-back) はコンテナ名を変えるだけ
+docker compose exec ecs-exec \
+  ecs-exec shell app-back                     # 上と等価な短縮形 (実行前に等価コマンドを表示)
+
+# 1 コマンドだけ実行する
+docker compose exec ecs-exec ecs-exec run app-back -- ls -l /mnt/logs
+```
+
+ファイルの投入・取り出しは、ECS Exec に転送機能が無いという前提のまま、
+実運用と同じ **base64 をコマンド行に載せる方式** で行う (`docker cp` は使わない)。
+分割送信のあと sha256 で突き合わせる。
+
+```bash
+cp ./myapp.war compose/ecs-exec/files/        # ここが ecs-exec の /work
+docker compose exec ecs-exec \
+  ecs-exec put /work/myapp.war app-front:/opt/server/standalone/deployments/myapp.war
+docker compose exec ecs-exec \
+  ecs-exec get app-back:/mnt/logs/app-back.log /work/app-back.log
+```
+
+- 接続先 (クラスター / タスク ID / コンテナ名 → compose サービス) は
+  `compose/ecs-exec/tasks.json` で差し替え可能。値は `ecs-metadata-mock` の
+  タスクメタデータおよび `ecs/taskdef.json` のコンテナ名と一致させてある
+- 失敗も実物と同じ例外名で再現できる (`ClusterNotFoundException` /
+  `TargetNotConnectedException` / `enableExecuteCommand` 無効時の
+  `InvalidParameterException` など)
+- セッションの内容は `compose/ecs-exec/sessions/<task-id>/<container>/<session-id>.log`
+  に残る (実 ECS Exec のセッションログ保管と同じ階層)
+- 前提の点検は `docker compose exec ecs-exec ecs-exec doctor`、
+  通しの確認は `./verify-ecs-exec.sh`
+- 実 AWS 側でこれを使うにはタスクロールに `ssmmessages:*` が要る
+  (`ecs/iam/task-role-policy.json` の `ECSExecSSMMessages`)
+
+**実装・設定方法の詳細は [docs/ECS-EXEC.md](docs/ECS-EXEC.md) を参照。**
 
 ## 自己証明書 (cacert.crt) による HTTPS 検証 (secure-api / JDK・JBoss トラストストア / ALB)
 

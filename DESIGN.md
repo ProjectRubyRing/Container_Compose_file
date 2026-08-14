@@ -45,6 +45,7 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 | CA 証明書の配布 (S3 / Secrets Manager / 社内配布サーバ → CI がビルド前に取得) | pki-init が `compose/pki/export/` へ**出力** | named volume は `docker build` から見えないため、`cacert.crt` をホストへも書き出す。ベースイメージと同じ **build secret** (`--mount=type=secret,id=cacert`) でビルドへ渡せるほか、そのまま `compose/pki/provided/` へ置いて CA を固定できる。詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) 3 章 |
 | 自己証明書で HTTPS を要求する外部 API | WireMock (secure-api, `--disable-http`) | HTTPS のみ listen。★接続確認用のテスト接続先。front/back は `cacert.crt` を **JDK と JBoss(Elytron) の両トラストストア**へ取り込んで呼び出す。詳細は [docs/TLS-SELF-SIGNED-ALB.md](docs/TLS-SELF-SIGNED-ALB.md) |
 | ALB の HTTPS リスナー + ACM 証明書 | alb (nginx) の `listen 443 ssl` | 証明書は自己署名リーフ / `cacert.crt` 発行を `./alb-tls-cert.sh` で切り替え。`/secure/*` はターゲットへ HTTPS 再暗号化 |
+| ECS Exec (`aws ecs execute-command` + SSM チャネル) | ecs-exec (docker exec に読み替える偽装 CLI) | 入口・引数・出力・例外名を実物にそろえ、接続先は `tasks.json` で `app-front → frontend` / `app-back → backend` と対応づける。ファイル投入も実運用と同じ「base64 をコマンド行に載せる」方式。詳細は [docs/ECS-EXEC.md](docs/ECS-EXEC.md) |
 
 ECS ではタスク内 localhost 通信、compose では各サービスが別ネットワーク名前空間という
 差分は、宛先をすべて環境変数 (`OTEL_EXPORTER_OTLP_ENDPOINT` / `BACK_BASE_URL` /
@@ -127,7 +128,10 @@ MySQL 固有の考慮:
 ### 2.6 IAM の最小権限
 
 - **タスクロール** (アプリ実行時): X-Ray への書き込み + サンプリング API、
-  cwagent 用の `PutMetricData` (namespace 条件付き) と EMF ロググループ
+  cwagent 用の `PutMetricData` (namespace 条件付き) と EMF ロググループ、
+  ECS Exec 用の `ssmmessages:*` 4 つ (`ECSExecSSMMessages`)。
+  ECS Exec は SSM のチャネルを**タスク側から**張るため、これはタスクロールに要る
+  (タスク実行ロールではない)。使わない構成ならステートメントごと削除してよい
 - **タスク実行ロール** (起動時): ECR pull (リポジトリ限定)、awslogs、
   `ssm:GetParameters` (パラメータを列挙して限定)、SecureString 復号用 `kms:Decrypt`
   (`kms:ViaService` で SSM 経由に限定)
@@ -198,6 +202,35 @@ JVM と JBoss EAP のトラストストアへ取り込む作りになってい�
 [compose/pki/export/README.md](compose/pki/export/README.md)。
 一覧表は [docs/PKI-CACERT-EXPORT.xlsx](docs/PKI-CACERT-EXPORT.xlsx) (Excel, 8 シート)。
 
+### 2.9 ECS Exec は「コマンド体系」を偽装し、チャネルだけ docker exec に読み替える
+
+ECS Exec の実体は AWS CLI → ECS API → SSM の制御/データチャネル →
+コンテナ内の ExecuteCommandAgent という多段構成で、ローカルには SSM が無い。
+そこで **利用者から見える層 (コマンド・引数・応答・例外) を実物に合わせ、
+運ぶ層だけを `docker exec` に置き換える** 方針を採った。
+
+- **なぜ `docker compose exec frontend bash` で済ませないのか**: それは compose 固有の
+  操作で、実 AWS には対応物が無い。手順書・訓練・切り分けの練習には
+  「本番でそのまま打てるコマンド」であることに意味がある。`ecs-exec` の
+  補助コマンドも、実行前に等価な `aws ecs execute-command` を必ず表示する
+- **`docker cp` を使わない**: 実 ECS Exec に転送機能が無い以上、それを使えると
+  誤解させる偽装は有害になる。`ecs-exec put` / `get` は実運用と同じ
+  「base64 をコマンド行へ載せて分割送信 → コンテナ側でデコード → sha256 照合」
+  を自動化しているだけで、出力されるコマンドはそのまま実 AWS でも通る
+- **失敗の再現を等価性の要にした**: ECS Exec の実務上の難所は「入れないときに
+  何が原因か」の切り分けにある。`enableExecuteCommand` 無効・エージェント未起動・
+  クラスター名の指定漏れ・コンテナ名の取り違えを、実物と同じ例外名
+  (`InvalidParameterException` / `TargetNotConnectedException` /
+  `ClusterNotFoundException`) で再現できるようにした
+- **接続先は `tasks.json` に外出し**: クラスター名・タスク ID・コンテナ名・
+  `runtimeId` は `ecs-metadata-mock` のタスクメタデータと同じ値にしてあり、
+  ECS のコンテナ名 (`app-front` / `app-back`) から compose サービス
+  (`frontend` / `backend`) への対応もここだけで決まる
+- **docker ソケットを渡すのはこのサービスだけ**。「タスクの中へ入れる」という
+  ECS Exec の性質そのものであり、テスト環境限定で使う前提
+
+詳細は [docs/ECS-EXEC.md](docs/ECS-EXEC.md)。
+
 ---
 
 ## 3. ECS デプロイ手順
@@ -224,6 +257,14 @@ AWS_REGION=... APP_NAME=... ENV=... ./register-parameters.sh
 aws ecs register-task-definition --cli-input-json file://ecs/taskdef.json
 aws ecs update-service --cluster <ECS_CLUSTER_NAME> --service <ECS_SERVICE_NAME> \
   --task-definition <APP_NAME>-<ENV>-task --force-new-deployment
+
+# 5. (任意) ECS Exec を使う場合。タスク定義ではなく★サービス★のパラメータで、
+#    有効化しても既存タスクには効かないため置き換えが要る
+#    (タスクロールの ssmmessages:* は ecs/iam/task-role-policy.json に入っている)
+aws ecs update-service --cluster <ECS_CLUSTER_NAME> --service <ECS_SERVICE_NAME> \
+  --enable-execute-command --force-new-deployment
+aws ecs execute-command --cluster <ECS_CLUSTER_NAME> --task <TASK_ID> \
+  --container app-front --interactive --command "/bin/bash"
 ```
 
 確認: X-Ray コンソール → トレース → フィルタ式
@@ -361,6 +402,21 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
 | メニューに項目が出ない | `alb-healthcheck` が起動していない (`docker compose up -d alb-healthcheck`)、または選んだサービスが `targets.json` のターゲットに無い |
 
 詳細は [docs/ALB-HEALTHCHECK.md](docs/ALB-HEALTHCHECK.md) を参照。
+
+### ECS Exec 関連 (ecs-exec / aws ecs execute-command)
+
+| 症状 | 原因と対処 |
+|---|---|
+| `ClusterNotFoundException: Cluster not found.` | `--cluster` の指定漏れ / 誤り。省略すると実物と同じく `default` クラスターを探しに行く。`ecs-exec tasks` で正しいクラスター名を確認する |
+| `InvalidParameterException: ... execute command was not enabled ...` | `enableExecuteCommand` が false。`aws ecs update-service --cluster ... --service ... --enable-execute-command` で戻す。**実 AWS ではこの変更後にタスクの置き換え (`--force-new-deployment`) が要る**点も注意 |
+| `TargetNotConnectedException` | 接続先コンテナが動いていない。`ecs-exec doctor` の `ExecuteCommandAgent:` 行と `docker compose ps` を見る |
+| `The container does not exist in the task.` | `--container` に compose のサービス名を書いている。実 AWS で通るのはタスク定義のコンテナ名 (`app-front` / `app-back`) |
+| `Cannot connect to the Docker daemon` (doctor が NG) | docker ソケットが渡っていない。既定は `/var/run/docker.sock`。rootless Docker などパスが違う場合は `.env` の `DOCKER_SOCKET` で指定する |
+| `--command "... \| grep ..."` が動かない | ECS Exec は `--command` をシェルに渡さない (実物と同じ)。`--command "sh -c '... \| grep ...'"` と書く |
+| `ecs-exec put` が `Permission denied` | front/back は jboss (UID 185) で動くため書けない場所がある。実 ECS Exec も同じ制約。テスト目的なら `--user root` (偽装限定) |
+| `ecs-exec put` が遅い | 1 チャンク = 1 セッションで送るため。`ECS_EXEC_PUT_CHUNK_CHARS` を増やすと減る (実物の引数長制限を模した既定値は 16384 文字) |
+
+詳細は [docs/ECS-EXEC.md](docs/ECS-EXEC.md) を参照。
 
 ### cacert.crt の出力 (export) / build secret 関連
 

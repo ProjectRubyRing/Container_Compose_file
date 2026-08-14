@@ -49,6 +49,10 @@
 #   alb の HTTPS リスナー      → ACM 証明書を適用した ALB の HTTPS リスナーの代替。
 #                               証明書は自己署名 / 中間 CA 発行を切り替えられる
 #   tls-verifier              → 上記 TLS 経路を機械的に検証する (profiles: verify)
+#   ecs-exec                  → ECS Exec (aws ecs execute-command) の代替。
+#                               実物と同じコマンド体系で frontend / backend の
+#                               中に入り、ファイルの投入・取り出しもできる
+#                               (チャネルの実体は SSM ではなく docker exec)
 #
 # ECS では同一タスク内 localhost 通信だが、compose では各サービスが別ネットワーク
 # 名前空間のため、宛先を環境変数 (OTEL_EXPORTER_OTLP_ENDPOINT / BACK_BASE_URL 等)
@@ -970,6 +974,81 @@ services:
     depends_on:
       maintenance-lambda:
         condition: service_started
+
+  # ===========================================================================
+  # ECS Exec (aws ecs execute-command) のローカル代替
+  # ---------------------------------------------------------------------------
+  # 実 AWS では、運用者の手元から次の 1 コマンドで「動いているタスクの中の特定の
+  # コンテナ」へ入れる。経路は AWS CLI + session-manager-plugin → SSM の
+  # 制御/データチャネル → コンテナ内の ExecuteCommandAgent:
+  #
+  #   aws ecs execute-command --cluster myapp-local-cluster \
+  #     --task 158d1c8083dd49d6b527399fd6414f5c \
+  #     --container app-front --interactive --command "/bin/bash"
+  #
+  # このサービスはその★コマンド体系だけ★をローカルへ持ち込む。チャネルの実体は
+  # SSM ではなく docker exec (/var/run/docker.sock) だが、入口・引数・出力・
+  # エラー (ClusterNotFoundException / TargetNotConnectedException など) は
+  # 実物にそろえてある。接続先は compose/ecs-exec/tasks.json (★差し替え可能★) で
+  # 「ECS のコンテナ名 → compose サービス」を対応づける:
+  #     app-front → frontend / app-back → backend
+  #     (+ adot-collector / cwagent。ecs-metadata-mock のタスク定義と同じ 4 コンテナ)
+  #
+  #   docker compose exec ecs-exec ecs-exec tasks     # 接続先とコマンド例
+  #   docker compose exec ecs-exec aws ecs execute-command --cluster ... (上と同じ)
+  #   docker compose exec ecs-exec ecs-exec put /work/app.war app-front:/tmp/app.war
+  #
+  # ファイル投入は実 ECS Exec に SCP が無いのと同じ前提のもと、実運用と同じ
+  # 「base64 にしてコマンド行へ載せる」方式で行う (docker cp は使わない)。
+  # 詳細は docs/ECS-EXEC.md を参照。
+  #
+  # ★docker ソケットをマウントする★のはこのサービスだけ。ECS Exec の
+  # 「タスクの中へ入れる」という性質そのものなので、テスト環境限定で使うこと。
+  # ===========================================================================
+  ecs-exec:
+    build:
+      context: ./compose/ecs-exec
+      dockerfile: Dockerfile
+    container_name: ecs-exec
+    environment:
+      # 接続先の定義 (★差し替え可能★。コンテナ内パス)
+      ECS_EXEC_TASKS_FILE: /etc/ecs-exec/tasks.json
+      # tasks.json の compose_service からコンテナを引くときのプロジェクト名
+      # (compose.yaml 冒頭の name: と一致させる)
+      ECS_EXEC_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-eap-adot-local}
+      # セッションログ (実 ECS Exec の CloudWatch Logs / S3 保管相当) の出力先
+      ECS_EXEC_SESSION_LOG_DIR: /var/log/ecs-exec
+      # ホストとの受け渡し場所 (put / get の相対パスの基準)
+      ECS_EXEC_FILES_DIR: /work
+      # update-service で切り替えた enableExecuteCommand の保存先
+      ECS_EXEC_STATE_FILE: /var/lib/ecs-exec/state.json
+      # 0 にすると「タスク起動時に execute command を有効化しなかった」状態を再現し、
+      # 実物と同じ InvalidParameterException を返す
+      ECS_EXEC_ENABLED: "1"
+      # 1 にすると session-manager-plugin 未導入のエラーを再現する
+      ECS_EXEC_SIMULATE_PLUGIN_MISSING: "0"
+      # 1 セッションで送る base64 の文字数 (実物の引数長制限に相当)
+      ECS_EXEC_PUT_CHUNK_CHARS: "16384"
+      AWS_REGION: ap-northeast-1
+      AWS_DEFAULT_REGION: ap-northeast-1
+    volumes:
+      # SSM の制御/データチャネルの代役。ここから frontend / backend の中で
+      # コマンドを実行する (Docker Desktop 以外では DOCKER_SOCKET で上書きする)
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - ./compose/ecs-exec/tasks.json:/etc/ecs-exec/tasks.json:ro
+      # 偽装本体。ホスト側を直して再起動するだけで差し替えられる
+      - ./compose/ecs-exec/ecs-exec.py:/opt/ecs-exec/ecs-exec.py:ro
+      - ./compose/ecs-exec/files:/work
+      - ./compose/ecs-exec/sessions:/var/log/ecs-exec
+    # frontend / backend が落ちている状態も再現対象 (TargetNotConnectedException)
+    # なので depends_on は付けない
+    healthcheck:
+      # 偽装サービス自身の点検のみ (接続先の状態は含めない)
+      test: ["CMD", "ecs-exec", "doctor", "--self-only", "--quiet"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
 
 volumes:
   mysql-data:

@@ -18,6 +18,16 @@ compose/pki/export/*
 !compose/pki/export/README.md
 !compose/pki/export/.gitkeep
 
+# ecs-exec (ECS Exec 偽装) がやり取りするファイルとセッションログ。
+# 中身は実行のたびに変わるためコミットしない
+# (README.md と .gitkeep だけを管理対象にする)
+compose/ecs-exec/files/*
+!compose/ecs-exec/files/README.md
+!compose/ecs-exec/files/.gitkeep
+compose/ecs-exec/sessions/*
+!compose/ecs-exec/sessions/README.md
+!compose/ecs-exec/sessions/.gitkeep
+
 # Terraform (terraform/ 配下)。.terraform.lock.hcl は再現性のためコミットする
 **/.terraform/*
 *.tfstate

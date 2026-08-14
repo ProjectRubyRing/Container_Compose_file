@@ -27,6 +27,17 @@
       }
     },
     {
+      "Sid": "ECSExecSSMMessages",
+      "Effect": "Allow",
+      "Action": [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "CloudWatchAgentEmfLogs",
       "Effect": "Allow",
       "Action": [

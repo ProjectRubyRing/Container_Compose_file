@@ -1,0 +1,91 @@
+{
+  "_comment": [
+    "ECS Exec 偽装 (ecs-exec) の対象定義 (★差し替え可能★)。",
+    "実 AWS の『クラスター → タスク → コンテナ』の階層をそのまま持ち、",
+    "各コンテナを compose のサービス (= docker のコンテナ) へ結び付ける。",
+    "クラスター名 / タスク ID / コンテナ名 / runtime_id は ecs-metadata-mock",
+    "(compose/ecs-metadata-mock/mappings/task-metadata.json) と一致させてある。",
+    "aws ecs execute-command --container に渡すのは ★ECS 側のコンテナ名★ (app-front / app-back)。",
+    "aliases は偽装サービス独自の別名 (実 AWS では通らないので docs/ECS-EXEC.md 参照)。"
+  ],
+  "region": "ap-northeast-1",
+  "account_id": "111122223333",
+  "clusters": [
+    {
+      "name": "myapp-local-cluster",
+      "services": [
+        {
+          "name": "myapp-local-service",
+          "task_definition": "myapp-local-task:1",
+          "_comment": "実 AWS では ECS サービス側の enableExecuteCommand。false にすると execute-command が InvalidParameterException で失敗する (aws ecs update-service で切り替えられる)",
+          "enable_execute_command": true
+        }
+      ],
+      "tasks": [
+        {
+          "task_id": "158d1c8083dd49d6b527399fd6414f5c",
+          "service": "myapp-local-service",
+          "task_definition": "myapp-local-task:1",
+          "launch_type": "FARGATE",
+          "platform_version": "1.4.0",
+          "platform_family": "Linux",
+          "availability_zone": "ap-northeast-1a",
+          "cpu": "2048",
+          "memory": "4096",
+          "private_ip": "10.0.2.61",
+          "subnet_id": "subnet-0a1b2c3d4e5f67890",
+          "containers": [
+            {
+              "name": "app-front",
+              "compose_service": "frontend",
+              "docker_container": "frontend",
+              "runtime_id": "158d1c8083dd49d6b527399fd6414f5c-1234567890",
+              "container_uuid": "0a1b2c3d-4e5f-6789-0abc-def012345601",
+              "image": "111122223333.dkr.ecr.ap-northeast-1.amazonaws.com/myapp-front:local",
+              "cpu": "768",
+              "memory": "1536",
+              "exec_agent": "auto",
+              "aliases": ["frontend", "front"]
+            },
+            {
+              "name": "app-back",
+              "compose_service": "backend",
+              "docker_container": "backend",
+              "runtime_id": "158d1c8083dd49d6b527399fd6414f5c-2345678901",
+              "container_uuid": "0a1b2c3d-4e5f-6789-0abc-def012345602",
+              "image": "111122223333.dkr.ecr.ap-northeast-1.amazonaws.com/myapp-back:local",
+              "cpu": "768",
+              "memory": "1536",
+              "exec_agent": "auto",
+              "aliases": ["backend", "back"]
+            },
+            {
+              "name": "adot-collector",
+              "compose_service": "adot-collector",
+              "docker_container": "adot-collector",
+              "runtime_id": "158d1c8083dd49d6b527399fd6414f5c-3456789012",
+              "container_uuid": "0a1b2c3d-4e5f-6789-0abc-def012345603",
+              "image": "public.ecr.aws/aws-observability/aws-otel-collector:v0.43.3",
+              "cpu": "256",
+              "memory": "512",
+              "exec_agent": "auto",
+              "aliases": []
+            },
+            {
+              "name": "cwagent",
+              "compose_service": "cwagent",
+              "docker_container": "cwagent",
+              "runtime_id": "158d1c8083dd49d6b527399fd6414f5c-4567890123",
+              "container_uuid": "0a1b2c3d-4e5f-6789-0abc-def012345604",
+              "image": "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest",
+              "cpu": "256",
+              "memory": "512",
+              "exec_agent": "auto",
+              "aliases": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
