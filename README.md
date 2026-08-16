@@ -457,6 +457,53 @@ terraform output -raw ecs_taskdef_secrets   # taskdef へ貼る secrets ブロ�
 
 **実装・設定方法の詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md) を参照。**
 
+#### `unable to get http response from http://169.254.170.2/v2/metadata` が出るとき
+
+```
+W! retry [0/3], unable to get http response from http://169.254.170.2/v2/metadata,
+   error: unable to get response from http://169.254.170.2/v2/metadata, error: ...
+I! access ECS task metadata fail with response ..., assuming I'm not running in ECS.
+```
+
+**`ecs-metadata-mock` が居ることが原因ではない。逆に、cwagent だけがそのモックを
+参照していなかったことが原因。** CloudWatch Agent は起動時 (config-translator) に
+「自分は ECS で動いているか」を判定するため、
+
+1. `ECS_CONTAINER_METADATA_URI_V4` → その値 + `/task`
+2. `ECS_CONTAINER_METADATA_URI` (v3) → その値 + `/task`
+3. **どちらも無ければ、ソースに埋め込まれた v2 エンドポイント
+   `http://169.254.170.2/v2/metadata`** (`RUN_IN_CONTAINER=True` のときのみ。
+   この変数はエージェントのイメージ側で設定済み)
+
+の順に参照する。`169.254.170.2` は ECS エージェントがタスクへ用意するリンクローカル
+アドレスで、compose の bridge ネットワークには存在しない。したがって 3 に落ちると
+**1 秒 × 3 回リトライして失敗し、「ECS ではない」と誤判定する**。
+
+実 ECS ではこの変数がタスク内の**全コンテナ**へ自動注入されるため 3 には落ちない。
+つまりこの警告は「ローカルだけ ECS と条件が違う」ことの表れであり、
+`compose.yaml` の `cwagent` / `cwagent-ssm` へ front/back/adot-collector と同じく
+`ECS_CONTAINER_METADATA_URI_V4` を与えることで解消する (設定済み)。ID は
+`compose/ecs-metadata-mock/mappings/task-metadata.json` の `Containers[]` にある
+`cwagent` の `DockerId` と一致させること。
+
+```bash
+# 判定 (./verify-local.sh の 13-3 が自動で確認する)
+docker inspect cwagent --format '{{range .Config.Env}}{{println .}}{{end}}' | grep ECS_CONTAINER_METADATA
+docker compose logs cwagent | grep 169.254.170.2   # 何も出なければ OK
+
+# 既存コンテナには環境変数が反映されないので作り直す
+docker compose up -d --force-recreate cwagent
+```
+
+**この警告自体はログ転送を止めない**ので、イベントが 0 件のときの原因としては下の表を
+先に疑うこと。ただし ECS 判定は以下に効くため、そろえておくと実 ECS との差が減る:
+
+| ECS 判定 | 影響 |
+| --- | --- |
+| `logs.log_stream_name` の既定値 | ECS と判定できたとき: `:` を `_` に置換したタスク ARN (実 ECS と同じ)。できないとき: コンテナのホスト名 (Docker が振る 12 桁の乱数 ID)。※ `collect_list[].log_stream_name` を明示していれば、そちらが優先されるので現行構成の 2 ストリームには影響しない |
+| 起動時間 | 失敗時は 1 秒 × 3 回 + バックオフを待ってから先へ進む |
+| 検出モード | 失敗時は `OnPremise`、成功時は `EC2`。コンテナ実行時は `common-config.toml` を読まない (`config-translator` に `--config` が渡らない) ため、**認証情報の解決経路は変わらない** (どちらも SDK 既定のチェーン → マウントした `/root/.aws/credentials` の `[default]`) |
+
 #### ログストリームが作られない / イベントが 0 件のとき
 
 `cloudwatch-logs-mock` はスタブなので「ログストリーム」の実体は持たない。判定は WireMock の

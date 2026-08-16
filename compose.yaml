@@ -20,7 +20,11 @@
 #   valkey                    → ElastiCache for Valkey の代替
 #   svf-mock (WireMock)       → ALB 越しの SVF 帳票サーバの代替
 #   ecs-metadata-mock         → ECS Task Metadata Endpoint v4
-#                               (ECS_CONTAINER_METADATA_URI_V4) のダミー応答
+#                               (ECS_CONTAINER_METADATA_URI_V4) のダミー応答。
+#                               実 ECS はタスク内の **全コンテナ** へこの変数を注入するので、
+#                               ローカルでも front/back/adot-collector/cwagent(-ssm) の
+#                               すべてに設定する (未設定のコンテナは 169.254.170.2 など
+#                               リンクローカルへ直接アクセスして失敗する)
 #   efs-mock                  → EFS の代替 (アクセスポイント不使用・マウントポイントのみ
 #                               利用する想定)。named volume を UID 6301 / GID 6302 で
 #                               初期化し、front/back へ /mnt/logs, /mnt/data として共有
@@ -446,6 +450,21 @@ services:
     command: ["/opt/aws/amazon-cloudwatch-agent/bin/start-amazon-cloudwatch-agent"]
     environment:
       AWS_REGION: ap-northeast-1
+      # --- ECS 判定用のタスクメタデータ (front/back/adot-collector と同じ扱い) ------
+      # CloudWatch Agent は起動時 (config-translator) に「自分は ECS で動いているか」を
+      # 判定するため、環境変数を ECS_CONTAINER_METADATA_URI_V4 → ECS_CONTAINER_METADATA_URI
+      # の順に見て、**どちらも無ければソースに埋め込まれた v2 エンドポイント
+      # http://169.254.170.2/v2/metadata へ直接アクセスする** (RUN_IN_CONTAINER=True の
+      # ときのみ。この変数はイメージ側で設定済み)。
+      # 169.254.170.2 は ECS エージェントが用意するリンクローカルアドレスで、compose の
+      # bridge ネットワークには存在しない。そのため未設定のままだと 1 秒 × 3 回リトライして
+      #   W! retry [n/3], unable to get http response from http://169.254.170.2/v2/metadata,
+      #      error: unable to get response from http://169.254.170.2/v2/metadata, ...
+      # を出し、最後に「ECS ではない」と誤判定する (実 ECS では必ず注入されるので起きない)。
+      # 実 ECS と同じ状態にするため、他コンテナと同様にモックを指す。
+      # ID は compose/ecs-metadata-mock/mappings/task-metadata.json の
+      # Containers[] にある cwagent の DockerId と一致させること。
+      ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-4567890123
       # 自己診断の対象と期待値 (efs-mock の初期化値に合わせる)
       CWA_VERIFY_MOUNTS: /mnt/logs
       CWA_VERIFY_CONFIG_DIR: /etc/cwagentconfig
@@ -475,6 +494,11 @@ services:
         condition: service_healthy
       # 送信先 WireMock の listen 完了まで待つ (未 listen だと初回送信が捨てられる)
       cloudwatch-logs-mock:
+        condition: service_healthy
+      # ECS 判定は translator の起動直後 (= コンテナ起動の数秒後) に 1 回だけ行われる。
+      # WireMock の listen 前だと connection refused で同じ警告が出たまま
+      # 「ECS ではない」と確定してしまうため、healthy を待ってから起動する。
+      ecs-metadata-mock:
         condition: service_healthy
     healthcheck:
       # 起動時の自己診断が FAIL でなければ healthy。
@@ -528,6 +552,10 @@ services:
       - "/opt/aws/amazon-cloudwatch-agent/bin/start-amazon-cloudwatch-agent"
     environment:
       AWS_REGION: ap-northeast-1
+      # ECS 判定用のタスクメタデータ (理由は上の cwagent のコメントを参照)。
+      # cwagent-ssm は「同じ taskdef の cwagent コンテナを別の注入経路で起動したもの」
+      # なので、DockerId は cwagent と同じ値を使う (タスク定義上のコンテナは 1 つ)。
+      ECS_CONTAINER_METADATA_URI_V4: http://ecs-metadata-mock:8080/v4/158d1c8083dd49d6b527399fd6414f5c-4567890123
       # --- SSM Parameter Store 注入の偽装 (ssm-config-entrypoint.sh) ----------
       # 「環境変数名=パラメータ名」の空白区切り。並び順がそのままマージ順になる。
       # 値は ./compose/cwagent/ssm/<パラメータ名の最後の要素>.json から読む。
@@ -568,6 +596,9 @@ services:
       efs-mock:
         condition: service_healthy
       cloudwatch-logs-mock:
+        condition: service_healthy
+      # ECS 判定がモックの listen 前に走らないようにする (cwagent と同じ理由)
+      ecs-metadata-mock:
         condition: service_healthy
     healthcheck:
       # SSM 注入の偽装と、起動時の自己診断の両方が FAIL でなければ healthy。

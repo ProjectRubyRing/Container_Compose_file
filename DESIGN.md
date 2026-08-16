@@ -39,6 +39,7 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 | SVF 帳票サーバ (ALB) | WireMock (svf-mock) | REST スタブ |
 | EFS (/mnt/logs, /mnt/data。アクセスポイント不使用) | efs-mock + named volume | UID 6301 / GID 6302, mode 2775 (setgid) で初期化。front/back は `group_add: 6302` で書き込み。ホスト側の権限変更は不要 |
 | cwagent (ログ転送) | cwagent (同一イメージ) | 設定の `logs.endpoint_override` で送信先のみ cloudwatch-logs-mock へ差し替え (認証情報はダミー) |
+| ECS Task Metadata Endpoint v4 (`ECS_CONTAINER_METADATA_URI_V4` をタスク内の**全コンテナ**へ注入) | WireMock (ecs-metadata-mock) | front / back / adot-collector / cwagent (+ cwagent-ssm) の**すべて**にこの変数を与え、コンテナごとの `DockerId` まで taskdef と一致させる。1 つでも未設定だと、そのコンテナは ECS エージェントのリンクローカルアドレス (`169.254.170.2` 等) へ直接アクセスして失敗する |
 | cwagent の設定注入 (SSM SecureString → `CW_CONFIG_CONTENT` / `CW_CONFIG_CONTENT_MID`) | cwagent-ssm (同一イメージ, `profiles: ssm-config`) | 「SSM 取得 + KMS 復号」と「環境変数 → `/etc/cwagentconfig` への materialize」だけを偽装し、**設定のマージと解釈は実エージェントに行わせる**。詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md) |
 | CloudWatch Logs | WireMock (cloudwatch-logs-mock) | PutLogEvents 受信スタブ。request journal で送信内容を確認 |
 | AWS Private CA (ACM PCA) / 社内 CA | pki-init (openssl) | 自己証明書 `cacert.crt` → 各サーバ証明書を named volume で共有。トラストアンカーは `cacert.crt` 1 枚。**`compose/pki/provided/cacert.crt` に受領済みの証明書を置けばそれをそのまま使う** (無ければ自己署名 CA を自動発行)。鍵なしの受領物では発行専用の `local-test-ca` を併用する |
@@ -464,6 +465,15 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
   - `glob に一致するファイルが 0 件` → アプリの出力パスと `cwagent-config.json` の
     `file_path` の食い違い
   - `読み取り不可 (open 失敗)` → 偽装 EFS の 6301:6302 権限と `group_add` を確認
+- cwagent が `unable to get http response from http://169.254.170.2/v2/metadata` を出す
+  → **`ecs-metadata-mock` が居るせいではなく、cwagent がそれを参照していないのが原因。**
+  CloudWatch Agent は起動時に `ECS_CONTAINER_METADATA_URI_V4` → `ECS_CONTAINER_METADATA_URI`
+  の順で見て、どちらも無いとソース埋め込みの v2 エンドポイント (`169.254.170.2` =
+  ECS エージェントが用意するリンクローカルアドレス) へ直接アクセスする。compose の
+  bridge ネットワークには存在しないため 1 秒 × 3 回リトライして「ECS ではない」と誤判定する。
+  実 ECS はタスク内の**全コンテナ**へこの変数を注入するので、ローカルでも
+  front/back/adot-collector と同様に `cwagent` / `cwagent-ssm` へ与えてそろえてある。
+  判定は `./verify-local.sh` の 13-3。詳細は [README.md](README.md#efs--cloudwatch-logs-転送の偽装)。
 - SSM 注入方式 (`cwagent-ssm`) の確認は `./verify-cwagent-ssm.sh`。
   `docker compose --profile ssm-config up -d cwagent-ssm` で起動してから実行する
   (`profiles` でゲートしているため通常の `up` では起動しない)。

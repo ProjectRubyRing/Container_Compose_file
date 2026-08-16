@@ -186,6 +186,43 @@ else
   esac
 fi
 
+echo "-- 13-3) cwagent の ECS 判定 (タスクメタデータ参照) --"
+# CloudWatch Agent は起動時に ECS_CONTAINER_METADATA_URI_V4 →
+# ECS_CONTAINER_METADATA_URI の順で環境変数を見て、どちらも無ければソース埋め込みの
+# v2 エンドポイント http://169.254.170.2/v2/metadata へ直接アクセスする。
+# compose では到達できないため、未設定だと下記の警告を出して「ECS ではない」と誤判定する。
+CWA_META_ENV=$(docker inspect cwagent \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+  | grep '^ECS_CONTAINER_METADATA_URI_V4=' || true)
+if [[ -n "${CWA_META_ENV}" ]]; then
+  echo "  ${CWA_META_ENV}"
+else
+  echo "WARN: cwagent に ECS_CONTAINER_METADATA_URI_V4 がありません。"
+  echo "      compose.yaml の cwagent.environment を確認してください"
+  echo "      (未設定だと 169.254.170.2 へアクセスして失敗し、ECS 判定が落ちます)。"
+fi
+
+# モック側の request journal に cwagent からの /task 取得が残っているか
+CWA_META_HITS=$(curl -s -X POST http://localhost:8380/__admin/requests/count \
+  -H "Content-Type: application/json" \
+  -d '{"method":"GET","urlPath":"/v4/158d1c8083dd49d6b527399fd6414f5c-4567890123/task"}' 2>/dev/null \
+  | sed -n 's/.*"count"[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -n 1 || true)
+echo "  ecs-metadata-mock が受けた cwagent の /task 取得: ${CWA_META_HITS:-0} 件"
+
+# リンクローカルへのアクセス失敗が残っていないか (残っていれば上の設定が効いていない)
+# grep -q でパイプを早期に閉じると pipefail 下で docker 側が SIGPIPE で落ちて
+# 判定が反転しうるため、いったん変数へ受けてから中身で判定する。
+CWA_LINKLOCAL=$(docker compose logs --no-color cwagent 2>/dev/null \
+  | grep -F "169.254.170.2" || true)
+if [[ -n "${CWA_LINKLOCAL}" ]]; then
+  echo "WARN: cwagent が 169.254.170.2 (ECS メタデータ v2) へアクセスして失敗しています。"
+  echo "      ECS_CONTAINER_METADATA_URI_V4 の設定前に起動したコンテナが残っている可能性があります。"
+  echo "      docker compose up -d --force-recreate cwagent で作り直してください。"
+  echo "${CWA_LINKLOCAL}" | tail -n 3 | sed 's/^/    /'
+else
+  echo "  169.254.170.2 への到達失敗ログなし: OK"
+fi
+
 echo "=== 14. cwagent → cloudwatch-logs-mock (PutLogEvents) 送信の深堀 ==="
 echo "(cwagent の force_flush_interval=5s を待機中...)"
 sleep 10
