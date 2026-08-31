@@ -38,6 +38,7 @@ HTTP ポート衝突を避けるために back へ `-Djboss.socket.binding.port-
 | ElastiCache for Valkey | valkey:8.0 | — |
 | SVF 帳票サーバ (ALB) | WireMock (svf-mock) | REST スタブ |
 | EFS (/mnt/logs, /mnt/data。アクセスポイント不使用) | efs-mock + named volume | UID 6301 / GID 6302, mode 2775 (setgid) で初期化。front/back は `group_add: 6302` で書き込み。ホスト側の権限変更は不要 |
+| EFS を共有するバッチサーバー | batch-mock (alpine, `user: 6301:6302`) | 同じ named volume を `/mnt/logs` `/mnt/data` へマウントし、ファイル・ディレクトリ・**相対シンボリックリンク**を作成/書き換え/削除する。その内容が全コンテナへ反映されるかは `build_and_verify.sh` の「EFS マウント伝播確認」で突き合わせる。詳細は [compose/batch-mock/README.md](compose/batch-mock/README.md) |
 | cwagent (ログ転送) | cwagent (同一イメージ) | 設定の `logs.endpoint_override` で送信先のみ cloudwatch-logs-mock へ差し替え (認証情報はダミー) |
 | ECS Task Metadata Endpoint v4 (`ECS_CONTAINER_METADATA_URI_V4` をタスク内の**全コンテナ**へ注入) | WireMock (ecs-metadata-mock) | front / back / adot-collector / cwagent (+ cwagent-ssm) の**すべて**にこの変数を与え、コンテナごとの `DockerId` まで taskdef と一致させる。1 つでも未設定だと、そのコンテナは ECS エージェントのリンクローカルアドレス (`169.254.170.2` 等) へ直接アクセスして失敗する |
 | cwagent の設定注入 (SSM SecureString → `CW_CONFIG_CONTENT` / `CW_CONFIG_CONTENT_MID`) | cwagent-ssm (同一イメージ, `profiles: ssm-config`) | 「SSM 取得 + KMS 復号」と「環境変数 → `/etc/cwagentconfig` への materialize」だけを偽装し、**設定のマージと解釈は実エージェントに行わせる**。詳細は [docs/CWAGENT-SSM-CONFIG.md](docs/CWAGENT-SSM-CONFIG.md) |

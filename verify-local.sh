@@ -154,7 +154,7 @@ rm -f "${CFG_TMP}"
 
 # 偽装 EFS の named volume を front/back/cwagent が共有できているか (同一 volume 名か)
 echo "-- efs-logs volume を参照しているコンテナ --"
-for c in frontend backend cwagent efs-mock; do
+for c in frontend backend cwagent efs-mock batch-mock; do
   vols=$(docker inspect "$c" --format '{{range .Mounts}}{{if .Name}}{{.Name}}:{{.Destination}} {{end}}{{end}}' 2>/dev/null || true)
   echo "  ${c}: ${vols:-<取得できず>}"
 done
@@ -333,6 +333,61 @@ else
       python3 /opt/alb-healthcheck/healthcheck.py report --all \
       && echo "ALB ヘルスチェック判定: OK (全ターゲット healthy)" \
       || echo "NOTE: 上のレポートで状態・理由コード・ステータスコードを確認してください (initial は起動直後の正常な状態)"
+  fi
+fi
+
+echo "=== 16. 偽装バッチサーバー経由の EFS 伝播確認 (シンボリックリンク込み) ==="
+# 実環境では同じ EFS をバッチサーバーもマウントする。「マウントできている」ことと
+# 「置いたものが相手から同じように見える」ことは別物なので、偽装バッチサーバーから
+# ファイルと相対シンボリックリンクを作り、front/back/cwagent から読めるかを確かめる。
+if ! docker compose ps --services 2>/dev/null | grep -qx "batch-mock"; then
+  echo "SKIP: batch-mock サービスが起動していません (docker compose up -d batch-mock)"
+else
+  BATCH_CLI="/opt/batch-mock/efs-propagation.sh"
+  BATCH_TOKEN="verify-local-$$"
+  BATCH_MARKER="efs-propagation ${BATCH_TOKEN} created"
+  BATCH_UPDATED="efs-propagation ${BATCH_TOKEN} updated"
+
+  echo "-- 16-1) 偽装バッチサーバーの実行 uid:gid (efs-mock の初期化値と一致すること) --"
+  docker compose exec -T batch-mock sh -c 'printf "batch-mock uid:gid = %s:%s\n" "$(id -u)" "$(id -g)"' \
+    || echo "WARN: batch-mock の uid/gid を取得できません"
+
+  echo "-- 16-2) 偽装バッチサーバーからファイルと相対シンボリックリンクを作成 --"
+  if docker compose exec -T batch-mock /bin/sh "${BATCH_CLI}" write "${BATCH_TOKEN}" "${BATCH_MARKER}"; then
+    BATCH_LINK="/mnt/logs/batch-mock/${BATCH_TOKEN}-file.link"
+
+    echo "-- 16-3) 全コンテナからシンボリックリンク経由で読めるか --"
+    for c in frontend backend cwagent; do
+      if docker compose exec -T "$c" sh -c "cat '${BATCH_LINK}' 2>/dev/null" | grep -Fq "${BATCH_MARKER}"; then
+        echo "  ${c}: OK (${BATCH_LINK} をリンク経由で読めました)"
+      else
+        echo "  ${c}: WARN (${BATCH_LINK} を読めません。マウント / uid:gid / リンクの張り方を確認してください)"
+      fi
+    done
+    # マウント先が異なるコンテナ (efs-mock は /mnt/efs/logs) でも、相対リンクなら解決できる
+    if docker compose exec -T efs-mock sh -c "cat '/mnt/efs/logs/batch-mock/${BATCH_TOKEN}-file.link' 2>/dev/null" \
+        | grep -Fq "${BATCH_MARKER}"; then
+      echo "  efs-mock: OK (マウント先が違っても相対シンボリックリンクを解決できました)"
+    else
+      echo "  efs-mock: WARN (相対シンボリックリンクを解決できません)"
+    fi
+
+    echo "-- 16-4) 書き換えが全コンテナへ伝わるか (複製ではなく共有か) --"
+    docker compose exec -T batch-mock /bin/sh "${BATCH_CLI}" append "${BATCH_TOKEN}" "${BATCH_UPDATED}" >/dev/null \
+      || echo "WARN: batch-mock から追記できません"
+    for c in frontend backend cwagent; do
+      if docker compose exec -T "$c" sh -c "cat '${BATCH_LINK}' 2>/dev/null" | grep -Fq "${BATCH_UPDATED}"; then
+        echo "  ${c}: OK (更新が伝わりました)"
+      else
+        echo "  ${c}: WARN (更新が伝わっていません。コンテナごとの複製になっている可能性があります)"
+      fi
+    done
+
+    echo "-- 16-5) 後始末 --"
+    docker compose exec -T batch-mock /bin/sh "${BATCH_CLI}" cleanup "${BATCH_TOKEN}" \
+      && echo "  cleanup: OK" || echo "  cleanup: WARN (${BATCH_TOKEN} を含むファイルが残っている可能性があります)"
+  else
+    echo "WARN: batch-mock から EFS へ書き込めません (uid:gid 6301:6302 と mode 2775 を確認してください)"
   fi
 fi
 
