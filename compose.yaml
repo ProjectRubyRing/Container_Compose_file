@@ -28,6 +28,14 @@
 #   efs-mock                  → EFS の代替 (アクセスポイント不使用・マウントポイントのみ
 #                               利用する想定)。named volume を UID 6301 / GID 6302 で
 #                               初期化し、front/back へ /mnt/logs, /mnt/data として共有
+#   batch-mock                → 実環境で同じ EFS をマウントするバッチサーバーの代替。
+#                               efs-mock と同じ UID 6301 / GID 6302 で動き、
+#                               /mnt/logs, /mnt/data 上へファイル・ディレクトリ・
+#                               シンボリックリンクを作り・書き換え・消す。
+#                               その内容が front/back を含む全コンテナへ
+#                               シンボリックリンク経由で反映されるかを
+#                               build_and_verify.sh の
+#                               「EFS マウント伝播確認」で突き合わせる
 #   cwagent                   → ECS と同じ CloudWatch Agent イメージのサイドカー。
 #                               偽装 EFS 上のログファイルを検知して tail し、
 #                               logs.endpoint_override で cloudwatch-logs-mock へ送信
@@ -427,6 +435,62 @@ services:
       timeout: 3s
       retries: 5
       start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # 偽装バッチサーバー (実環境で同じ EFS をマウントするバッチサーバーの代替)
+  # - 実構成では frontend / backend と同じ EFS をバッチサーバーもマウントし、
+  #   バッチが置いたファイルをアプリが読む (あるいはその逆) 使い方をする。
+  #   「マウントできている」ことと「置いたものが相手から同じように見える」ことは
+  #   別物なので、それを機械的に確かめられるようにするためのサービス
+  # - efs-mock がマウントポイントを chown する UID 6301 / GID 6302 で動かす。
+  #   実環境のバッチサーバーと同じ所有者でファイルを作ることで、
+  #   uid/gid・setgid (2775)・umask のずれをそのまま再現できる
+  # - front/back と同じ named volume を、同じパス (/mnt/logs, /mnt/data) へ
+  #   読み書き可能でマウントする
+  # - CLI (compose/batch-mock/efs-propagation.sh) が EFS 上へファイル・
+  #   ディレクトリ・シンボリックリンクを作り・書き換え・消す。作ったものが
+  #   各コンテナからどう見えるかの突き合わせは build_and_verify.sh の
+  #   「EFS マウント伝播確認 (偽装バッチサーバー経由)」が行う
+  #   (--keep-container-mode logs のサービス操作)
+  # - シンボリックリンクは必ず相対パスで張る。絶対パスで張ると、同じボリュームを
+  #   別のパスへマウントしているコンテナ (efs-mock の /mnt/efs/logs 等) から
+  #   リンク先を解決できなくなるため
+  batch-mock:
+    image: alpine:3.21
+    container_name: batch-mock
+    # efs-mock が /mnt/efs/logs, /mnt/efs/data を chown する値と必ず合わせる。
+    # ずれていると「書けたのに他コンテナから更新できない」ファイルができる。
+    user: "6301:6302"
+    environment:
+      # 偽装バッチサーバーのコンテナ内 CLI の場所。build_and_verify.sh の
+      # 「EFS マウント伝播確認」メニューがこの値を見て docker exec する。
+      BATCH_MOCK_CLI: /opt/batch-mock/efs-propagation.sh
+      # EFS として扱うマウント先 (空白区切り)。CLI の mounts サブコマンドが
+      # そのまま返し、build_and_verify.sh 側の唯一の情報源になる。
+      BATCH_MOCK_EFS_DIRS: /mnt/logs /mnt/data
+    # efs-mock と同じ形 (sh -euc + ヒアドキュメント) で、起動時に作業領域だけ用意して待機する
+    command:
+      - sh
+      - -euc
+      - |
+        /bin/sh /opt/batch-mock/efs-propagation.sh init
+        exec tail -f /dev/null
+    volumes:
+      - ./compose/batch-mock/efs-propagation.sh:/opt/batch-mock/efs-propagation.sh:ro
+      # front/back と同じ偽装 EFS を、同じパスで読み書き可能にマウントする
+      - efs-logs:/mnt/logs
+      - efs-data:/mnt/data
+    depends_on:
+      # マウントポイントの chown / chmod が終わってから作業領域を作る
+      efs-mock:
+        condition: service_healthy
+    healthcheck:
+      # 作業領域が uid 6301 / gid 6302 で書ける状態かどうか
+      test: ["CMD-SHELL", "/bin/sh /opt/batch-mock/efs-propagation.sh ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   # ECS taskdef と同じ CloudWatch Agent イメージのサイドカー (ローカル用途はログ転送の偽装)
   # 偽装 EFS (/mnt/logs) に出力されたファイルを検知して tail し、

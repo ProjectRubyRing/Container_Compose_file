@@ -46,6 +46,8 @@ compose/
   alb/tls/                           # HTTPS リスナーに適用する証明書 (★差し替え可能★, variants/ あり)
   alb-healthcheck/healthcheck.py     # ALB ターゲットグループのヘルスチェック偽装 (ELB-HealthChecker/2.0)
   alb-healthcheck/targets.json       # 同 ヘルスチェック設定 (★差し替え可能★, path/matcher/interval/threshold)
+  batch-mock/efs-propagation.sh      # 偽装バッチサーバー (同じ EFS へファイル/相対シンボリックリンクを作成・書換・削除)
+  batch-mock/README.md               # 同 解説 (uid:gid 6301:6302 / setgid / 相対リンクにする理由)
   ecs-exec/ecs-exec.py, Dockerfile   # ECS Exec 偽装 (aws ecs execute-command 互換 + ファイル投入/取り出し)
   ecs-exec/tasks.json                # 同 接続先定義 (★差し替え可能★, ECS コンテナ名 → compose サービス)
   ecs-exec/files/                    # ★ホスト ⇔ コンテナのファイル受け渡し場所 (コンテナ内 /work。git 管理外)
@@ -352,6 +354,17 @@ cd ../Container_Compose_Build_Push_v2_from_Codex
   GID 6302 を共有する別プロセスが配下へディレクトリを作れなくなる問題を回避する
   (umask は `exec` 先の JBoss にも継承され、実行時に作るディレクトリ/ファイルも
   group-writable になる)。
+- `batch-mock` (偽装バッチサーバー) が **同じ named volume を `/mnt/logs` `/mnt/data` へ
+  読み書き可能でマウント**し、`efs-mock` と同じ **UID 6301 / GID 6302** で動く。実環境で
+  同じ EFS をマウントするバッチサーバーの代わりに、EFS 上へファイル・ディレクトリ・
+  **シンボリックリンク**を作り・書き換え・消すためのサービス。
+  「マウントできている」ことと「置いたものが相手から同じように見える」ことは別物なので
+  (`uid:gid` のずれ、setgid の付け忘れ、`umask 0022` による group write ビットの脱落、
+  `:ro` の付け違い、シンボリックリンクを絶対パスで張ったことによる解決失敗)、
+  その突き合わせを `build_and_verify.sh --keep-container-mode logs` の
+  **「EFS マウント伝播確認 (偽装バッチサーバー経由)」**で行う。
+  詳細は [compose/batch-mock/README.md](compose/batch-mock/README.md)。
+  シンボリックリンクは必ず**相対パス**で張る (マウント先が異なるコンテナでも解決できるように)。
 - `cwagent` (ECS taskdef と同じ CloudWatch Agent イメージ) が `/mnt/logs` の
   `app-front*.log` / `app-back*.log` を検知・tail し、`logs.endpoint_override` により
   実 AWS ではなく `cloudwatch-logs-mock` (WireMock, http://localhost:8480) へ PutLogEvents を送信する。
