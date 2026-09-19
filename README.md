@@ -17,6 +17,9 @@ docs/RDS-PROXY-TLS.md                # DB の TLS を RDS Proxy 相当にそろ�
 docs/TLS-SELF-SIGNED-ALB.md          # 自己署名証明書 HTTPS / JVM トラストストア / ALB 証明書の詳細ガイド
 docs/PKI-CACERT-EXPORT.xlsx          # ★cacert.crt の配備→出力→build secret→取り込み の一覧表 (Excel 8 シート)
 docs/tools/gen-pki-cacert-xlsx.py    #   ↑の生成スクリプト (内容を直すときはこちらを編集して再生成)
+docs/JMETER-LOADTEST.md              # ★性能試験 (JMeter) の実行方法と全設定項目の意味・推奨値の詳細ガイド
+docs/JMETER-SETTINGS.xlsx            # ★同 設定項目の一覧表 (Excel 14 シート。試験計画のレビュー用)
+docs/tools/gen-jmeter-settings-xlsx.py #  ↑の生成スクリプト
 .env.example                         # compose 用環境変数の雛形 (→ .env にコピー)
 verify-local.sh                      # ローカル動作確認スクリプト
 verify-async.sh                      # 非同期チェーンの動作確認スクリプト
@@ -52,6 +55,12 @@ compose/
   ecs-exec/tasks.json                # 同 接続先定義 (★差し替え可能★, ECS コンテナ名 → compose サービス)
   ecs-exec/files/                    # ★ホスト ⇔ コンテナのファイル受け渡し場所 (コンテナ内 /work。git 管理外)
   ecs-exec/sessions/                 # 同 セッションログの出力先 (実 ECS Exec のログ保管相当。git 管理外)
+  jmeter/Dockerfile, jmeter-run.sh   # 性能試験 (Apache JMeter) の実行コンテナと入口スクリプト
+  jmeter/user.properties             # 同 JMeter の実行時設定 (★差し替え可能★, 保存項目/タイムアウト/レポート閾値)
+  jmeter/targets.json                # 同 負荷をかける相手の定義 (★差し替え可能★, 既定は frontend)
+  jmeter/test-plans/                 # ★GUI で作った .jmx の置き場 (同梱サンプル 2 本 + CSV データ)
+  jmeter/results/                    # ★結果の出力先 (jtl / HTML レポート。GUI で開く。git 管理外)
+  jmeter/lib-ext/                    # 同 追加プラグイン jar の置き場 (任意。git 管理外)
   pki/gen-certs.sh, Dockerfile       # 自己署名 PKI 発行 (ルートCA→中間CA→サーバ証明書 / secure-api・ALB・MySQL)
   pki/provided/                      # ★受領した cacert.crt の投入口 (置くと provided モード。git 管理外)
   pki/export/                        # ★配備した cacert.crt の出力口 (build secret の入力 / provided への配置元。git 管理外)
@@ -209,6 +218,58 @@ docker compose exec ecs-exec \
   (`ecs/iam/task-role-policy.json` の `ECSExecSSMMessages`)
 
 **実装・設定方法の詳細は [docs/ECS-EXEC.md](docs/ECS-EXEC.md) を参照。**
+
+## 性能試験 (JMeter で frontend / backend へ負荷をかける)
+
+手元の JMeter GUI で作った `.jmx` を `compose/jmeter/test-plans/` へ置くと、
+`jmeter` コンテナが **compose ネットワークの中から** 非 GUI モードで実行し、
+**GUI で開ける結果 (jtl)** と **HTML ダッシュボード** を出す。
+
+```bash
+# 0) 初回だけイメージをビルド (Apache 配布の tgz を SHA-512 検証して展開)
+docker compose --profile loadtest build jmeter
+
+# 1) GUI で作った .jmx を置く
+cp ~/work/my-plan.jmx compose/jmeter/test-plans/
+
+# 2) 実行 (負荷をかける相手の既定は frontend)
+docker compose --profile loadtest run --rm jmeter run my-plan.jmx
+
+# 3) 結果を見る
+#    compose/jmeter/results/<日時>_<計画名>_<対象>/
+#      result.jtl        → JMeter GUI のリスナー (結果をツリーで表示 / 統計レポート) で開く
+#      report/index.html → ブラウザで開く (HTML ダッシュボード)
+
+# 相手を変える / 負荷条件を変える
+docker compose --profile loadtest run --rm \
+  -e JMETER_TARGET=backend -e JMETER_THREADS=50 -e JMETER_RAMPUP=50 -e JMETER_DURATION=600 \
+  jmeter run my-plan.jmx
+
+# 置いてある計画 / 投げ先の一覧 / 自己診断と到達確認
+docker compose --profile loadtest run --rm jmeter list
+docker compose --profile loadtest run --rm jmeter targets
+docker compose --profile loadtest run --rm jmeter doctor
+```
+
+- `profiles: loadtest` のため通常の `docker compose up` では起動しない
+  (常駐サービスではなく、実行のたびに起動して終わるジョブ)
+- 負荷をかける相手は `compose/jmeter/targets.json` で差し替え可能
+  (`frontend` 既定 / `backend` / `alb` / `alb-https` / `secure-api` ほか)。
+  テスト計画側を `${__P(target.host,frontend)}` の形で書いておけば、
+  **同じ .jmx が GUI でも CLI でもそのまま動く**
+- 負荷条件 (スレッド数 / ramp-up / 試験時間 / ThinkTime / タイムアウト) は
+  環境変数 (`.env` または `-e`) で指定する。JMeter 自体の設定は
+  `compose/jmeter/user.properties` (★差し替え可能★)
+- HTTPS の相手 (`alb-https` / `secure-api`) を選ぶと、`pki` ボリュームの
+  自己証明書 `cacert.crt` を keytool でトラストストアへ取り込んでから実行する
+- `JMETER_MAX_ERROR_RATE` を指定すると、エラー率がその値 (%) を超えたときに
+  終了コード 2 で終わる (CI からの合否判定用)
+- EAP のベースイメージが無くても `svf-mock` を相手にすれば配管だけ確認できる
+  (`docker compose up -d svf-mock` → `-e JMETER_TARGET=svf-mock`)
+
+**各設定項目の意味・推奨値・外すとどうなるかは
+[docs/JMETER-LOADTEST.md](docs/JMETER-LOADTEST.md) と
+[docs/JMETER-SETTINGS.xlsx](docs/JMETER-SETTINGS.xlsx) (Excel 14 シート) を参照。**
 
 ## 自己証明書 (cacert.crt) による HTTPS 検証 (secure-api / JDK・JBoss トラストストア / ALB)
 

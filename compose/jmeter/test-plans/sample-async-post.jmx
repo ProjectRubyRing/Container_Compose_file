@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sample-async-post.jmx : POST + 外部データ (CSV) のサンプル
+
+  ALB 経由で backend の非同期受け口 (POST /async/receive) を叩く。
+  GET だけのサンプル (sample-frontend.jmx) では足りない、次の 3 点を示す:
+    1. CSV データセット設定で 1 リクエストごとに別のデータを送る
+       (同じ値を投げ続けるとアプリ側のキャッシュに助けられ、性能を過大評価する)
+    2. JSON ボディを Raw で送る (postBodyRaw)
+    3. 応答本文の中身をアサーションで確認する
+
+  実行例 (対象を alb にする):
+    docker compose run jmeter run sample-async-post.jmx  (compose の profile 指定は README 参照)
+
+  詳細: docs/JMETER-LOADTEST.md / docs/JMETER-SETTINGS.xlsx
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="サンプル: 非同期受け口 POST 負荷試験" enabled="true">
+      <stringProp name="TestPlan.comments">ALB 経由で backend の /async/receive へ JSON を POST する。送るデータは CSV から 1 行ずつ読む。</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="ユーザー定義変数" enabled="true">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="PROTOCOL" elementType="Argument">
+            <stringProp name="Argument.name">PROTOCOL</stringProp>
+            <stringProp name="Argument.value">${__P(target.protocol,http)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">${__P(target.host,alb)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">既定は alb (ALB 経由の経路を測る)。backend を直接叩くなら target を backend にする</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">${__P(target.port,80)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="ASYNC_PATH" elementType="Argument">
+            <stringProp name="Argument.name">ASYNC_PATH</stringProp>
+            <stringProp name="Argument.value">${__P(async.path,/async/receive)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">backend のサーブレット (コンテキストルート /async + マッピング /receive)</stringProp>
+          </elementProp>
+          <elementProp name="CSV_FILE" elementType="Argument">
+            <stringProp name="Argument.name">CSV_FILE</stringProp>
+            <stringProp name="Argument.value">${__P(csv.file,/test-plans/data/orders.csv)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">送信データ。コンテナ内のパス (ホスト側は compose/jmeter/test-plans/data/)</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+      <stringProp name="TestPlan.user_define_classpath"></stringProp>
+    </TestPlan>
+    <hashTree>
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP リクエスト初期値" enabled="true">
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="ユーザー定義変数" enabled="true">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.protocol">${PROTOCOL}</stringProp>
+        <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">${__P(connect.timeout,5000)}</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">${__P(response.timeout,30000)}</stringProp>
+        <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+      </ConfigTestElement>
+      <hashTree/>
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP ヘッダマネージャ" enabled="true">
+        <stringProp name="TestPlan.comments">POST の Content-Type は必ず明示する。無いとサーブレット側の文字コード判定が環境依存になる。</stringProp>
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Content-Type</stringProp>
+            <stringProp name="Header.value">application/json; charset=utf-8</stringProp>
+          </elementProp>
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">User-Agent</stringProp>
+            <stringProp name="Header.value">JMeter-LoadTest/1.0 (compose)</stringProp>
+          </elementProp>
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">X-Source</stringProp>
+            <stringProp name="Header.value">jmeter</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+      <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="CSV データセット設定 (注文データ)" enabled="true">
+        <stringProp name="TestPlan.comments">1 リクエスト = CSV 1 行。recycle=true で行を使い切ったら先頭へ戻る。shareMode.all は全スレッドで 1 つのファイルを共有する設定 (= 同じ行が重複しない)。データを使い切ったら止めたい場合は recycle=false かつ stopThread=true にする。</stringProp>
+        <stringProp name="delimiter">,</stringProp>
+        <stringProp name="fileEncoding">UTF-8</stringProp>
+        <stringProp name="filename">${CSV_FILE}</stringProp>
+        <boolProp name="ignoreFirstLine">true</boolProp>
+        <boolProp name="quotedData">false</boolProp>
+        <boolProp name="recycle">true</boolProp>
+        <stringProp name="shareMode">shareMode.all</stringProp>
+        <boolProp name="stopThread">false</boolProp>
+        <stringProp name="variableNames">orderId,amount,itemCount</stringProp>
+      </CSVDataSet>
+      <hashTree/>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="TG01 非同期登録" enabled="true">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="ループコントローラ" enabled="true">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <stringProp name="LoopController.loops">${__P(loops,-1)}</stringProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,5)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(rampup,10)}</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,120)}</stringProp>
+        <stringProp name="ThreadGroup.delay">${__P(startup.delay,0)}</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">false</boolProp>
+      </ThreadGroup>
+      <hashTree>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="S01 POST 非同期受け口" enabled="true">
+          <stringProp name="TestPlan.comments">JSON を Raw ボディで送る (postBodyRaw=true)。ボディ内の ${orderId} 等は CSV データセットが 1 行ずつ差し替える。</stringProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{"orderId":"${orderId}","amount":${amount},"itemCount":${itemCount},"requestedAt":"${__time(yyyy-MM-dd'T'HH:mm:ss)}","source":"jmeter"}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">${ASYNC_PATH}</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.DO_MULTIPART_POST">false</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="A01 応答コード 200" enabled="true">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="49586">200</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">期待する応答コード 200 ではない</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">8</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="A02 応答本文に received を含む" enabled="true">
+            <stringProp name="TestPlan.comments">応答コードだけでは「200 を返すエラー画面」を見逃す。本文の判定も入れておくと、アプリが壊れた状態で「性能は出ていた」という誤った結論を避けられる。ただし本文判定は CPU を使うため、正規表現ではなく substring (test_type=16) にする。</stringProp>
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="-934396624">received</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">応答本文に received が含まれない</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">16</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+        <ConstantTimer guiclass="ConstantTimerGui" testclass="ConstantTimer" testname="TM01 固定待ち" enabled="true">
+          <stringProp name="TestPlan.comments">API 連携を模す場合、人の操作ではないので一様乱数ではなく固定間隔でよい。0 にすると全力で投げ続ける限界性能測定になる。</stringProp>
+          <stringProp name="ConstantTimer.delay">${__P(think.time.base,200)}</stringProp>
+        </ConstantTimer>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

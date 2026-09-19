@@ -42,3 +42,14 @@ override.tf.json
 *_override.tf.json
 .terraformrc
 terraform.rc
+
+# JMeter の試験結果 (実行のたびに増える。jtl / HTML レポートは大きい)。
+# (README.md と .gitkeep だけを管理対象にする)
+compose/jmeter/results/*
+!compose/jmeter/results/README.md
+!compose/jmeter/results/.gitkeep
+
+# JMeter の追加プラグイン jar (再現性が要るならバージョンをドキュメントへ控える)
+compose/jmeter/lib-ext/*
+!compose/jmeter/lib-ext/README.md
+!compose/jmeter/lib-ext/.gitkeep

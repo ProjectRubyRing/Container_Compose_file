@@ -24,6 +24,9 @@
 *.java      text eol=lf
 *.py        text eol=lf
 *.sql       text eol=lf
+*.jmx       text eol=lf
+*.properties text eol=lf
+*.csv       text eol=lf
 Dockerfile  text eol=lf
 
 # 証明書・鍵はテキストだが、改行変換されると検証に失敗しうるので LF 固定

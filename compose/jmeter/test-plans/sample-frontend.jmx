@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sample-frontend.jmx : 同梱サンプルのテスト計画 (JMeter 5.6.3 で作成)
+
+  そのまま jmeter-run の run サブコマンドで動く。
+  手元の JMeter GUI で開いて編集し、保存し直してもそのまま使える。
+
+  設計の要点:
+    1. 投げ先 (プロトコル/ホスト/ポート/パス) と負荷条件 (スレッド数/ramp-up/
+       試験時間/ThinkTime) は、すべて ${__P(名前, 既定値)} で外から差し込める。
+       jmeter-run が targets.json と環境変数から渡す。
+       GUI でそのまま開いたときは既定値 (frontend:8080) で動く。
+    2. リスナー (結果をツリーで表示 等) はあえて 1 つも入れていない。
+       非 GUI 実行では jtl ファイルが唯一の出力で、計画側にリスナーを入れると
+       メモリと CPU を食って測定値が歪む。結果は GUI 側で jtl を開いて見る。
+    3. 各要素の「コメント」欄 (GUI の Comments) に、その項目の意味と推奨値を
+       書いてある。GUI で開けばそのまま読める。
+
+  詳細: docs/JMETER-LOADTEST.md / docs/JMETER-SETTINGS.xlsx
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="サンプル: frontend 負荷試験" enabled="true">
+      <stringProp name="TestPlan.comments">compose の frontend (ECS の app-front 相当) へ HTTP 負荷をかけるサンプル。投げ先と負荷条件は -J プロパティで差し替え可能。</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="ユーザー定義変数" enabled="true">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="PROTOCOL" elementType="Argument">
+            <stringProp name="Argument.name">PROTOCOL</stringProp>
+            <stringProp name="Argument.value">${__P(target.protocol,http)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">http / https。targets.json の protocol</stringProp>
+          </elementProp>
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">${__P(target.host,frontend)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">投げ先ホスト。compose のサービス名がそのままホスト名になる</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">${__P(target.port,8080)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">投げ先ポート (frontend=8080 / backend=8180 / alb=80)</stringProp>
+          </elementProp>
+          <elementProp name="TARGET_PATH" elementType="Argument">
+            <stringProp name="Argument.name">TARGET_PATH</stringProp>
+            <stringProp name="Argument.value">${__P(target.path,/)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">最初に叩くパス。targets.json の path</stringProp>
+          </elementProp>
+          <elementProp name="CONNECT_TIMEOUT" elementType="Argument">
+            <stringProp name="Argument.name">CONNECT_TIMEOUT</stringProp>
+            <stringProp name="Argument.value">${__P(connect.timeout,5000)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">TCP 接続タイムアウト(ms)。推奨 3000-10000。0(無制限)にしないこと</stringProp>
+          </elementProp>
+          <elementProp name="RESPONSE_TIMEOUT" elementType="Argument">
+            <stringProp name="Argument.name">RESPONSE_TIMEOUT</stringProp>
+            <stringProp name="Argument.value">${__P(response.timeout,30000)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">応答タイムアウト(ms)。推奨は SLA の 2-3 倍。無制限にすると詰まりが見えなくなる</stringProp>
+          </elementProp>
+          <elementProp name="THINK_TIME_BASE" elementType="Argument">
+            <stringProp name="Argument.name">THINK_TIME_BASE</stringProp>
+            <stringProp name="Argument.value">${__P(think.time.base,500)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">操作間の待ち時間の固定部分(ms)。画面遷移を模すなら 1000-5000、限界性能測定なら 0</stringProp>
+          </elementProp>
+          <elementProp name="THINK_TIME_RANGE" elementType="Argument">
+            <stringProp name="Argument.name">THINK_TIME_RANGE</stringProp>
+            <stringProp name="Argument.value">${__P(think.time.range,1000)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+            <stringProp name="Argument.desc">待ち時間のランダム幅(ms)。0 にすると全スレッドの要求が同じ周期で揃い、実態とかけ離れる</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+      <stringProp name="TestPlan.user_define_classpath"></stringProp>
+    </TestPlan>
+    <hashTree>
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP リクエスト初期値" enabled="true">
+        <stringProp name="TestPlan.comments">全サンプラー共通の接続先とタイムアウト。実装は HttpClient4 (接続プールと Keep-Alive が正しく効く唯一の実装)。</stringProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="ユーザー定義変数" enabled="true">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.protocol">${PROTOCOL}</stringProp>
+        <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+        <stringProp name="HTTPSampler.path"></stringProp>
+        <stringProp name="HTTPSampler.concurrentPool">6</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">${CONNECT_TIMEOUT}</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">${RESPONSE_TIMEOUT}</stringProp>
+        <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+      </ConfigTestElement>
+      <hashTree/>
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP ヘッダマネージャ" enabled="true">
+        <stringProp name="TestPlan.comments">User-Agent を負荷試験用に固定しておくと、アプリ側のアクセスログで試験トラフィックだけを切り出せる。</stringProp>
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">User-Agent</stringProp>
+            <stringProp name="Header.value">JMeter-LoadTest/1.0 (compose)</stringProp>
+          </elementProp>
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Accept</stringProp>
+            <stringProp name="Header.value">text/html,application/json;q=0.9,*/*;q=0.8</stringProp>
+          </elementProp>
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Accept-Encoding</stringProp>
+            <stringProp name="Header.value">gzip, deflate</stringProp>
+          </elementProp>
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Accept-Language</stringProp>
+            <stringProp name="Header.value">ja,en;q=0.8</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+      <CookieManager guiclass="CookiePanel" testclass="CookieManager" testname="HTTP クッキーマネージャ" enabled="true">
+        <stringProp name="TestPlan.comments">セッション Cookie (JSESSIONID) をスレッドごとに保持する。これが無いと EAP 側で毎リクエスト新規セッションが作られ、実態よりメモリ負荷が高く出る。clearEachIteration=true は「繰り返しごとに新規ユーザ」の意味。</stringProp>
+        <collectionProp name="CookieManager.cookies"/>
+        <boolProp name="CookieManager.clearEachIteration">true</boolProp>
+        <boolProp name="CookieManager.controlledByThreadGroup">false</boolProp>
+        <stringProp name="CookieManager.policy">standard</stringProp>
+        <stringProp name="CookieManager.implementation">org.apache.jmeter.protocol.http.control.HC4CookieHandler</stringProp>
+      </CookieManager>
+      <hashTree/>
+      <CacheManager guiclass="CacheManagerGui" testclass="CacheManager" testname="HTTP キャッシュマネージャ" enabled="true">
+        <stringProp name="TestPlan.comments">ブラウザのキャッシュを模す。静的リソースを含む画面を測るときは必須 (無いと毎回全部取りに行き、実態より重く出る)。API 単体の限界性能を測るときは無効でよい。</stringProp>
+        <boolProp name="clearEachIteration">true</boolProp>
+        <boolProp name="useExpires">true</boolProp>
+        <boolProp name="CacheManager.controlledByThread">false</boolProp>
+        <intProp name="maxSize">5000</intProp>
+      </CacheManager>
+      <hashTree/>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="TG01 一般ユーザ" enabled="true">
+        <stringProp name="TestPlan.comments">スレッド数=同時実行ユーザ数。ramp-up は「全員が立ち上がるまでの秒数」で、最低でもスレッド数と同じ秒数を推奨 (10 スレッドなら 10 秒 = 毎秒 1 人ずつ増やす)。スケジューラ有効時は継続時間で終了する。</stringProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="ループコントローラ" enabled="true">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <stringProp name="LoopController.loops">${__P(loops,-1)}</stringProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">${__P(threads,10)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(rampup,10)}</stringProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.duration">${__P(duration,300)}</stringProp>
+        <stringProp name="ThreadGroup.delay">${__P(startup.delay,0)}</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">false</boolProp>
+      </ThreadGroup>
+      <hashTree>
+        <TransactionController guiclass="TransactionControllerGui" testclass="TransactionController" testname="TR01 トップ画面" enabled="true">
+          <stringProp name="TestPlan.comments">業務単位 (1 画面 / 1 業務) でまとめると、HTML レポートの統計をサンプラー単位ではなく業務単位で読める。parent=false は「配下のサンプルはそのまま残し、合計時間を別の 1 サンプルとして追加記録する」設定。parent=true (配下を内包した親サンプルにする) にすると、非 GUI 実行の進捗表示 (summariser) が 1 スレッドあたり 1 件しか数えなくなり、走行中に進捗が読めなくなるため既定は false にしている。</stringProp>
+          <boolProp name="TransactionController.includeTimers">false</boolProp>
+          <boolProp name="TransactionController.parent">false</boolProp>
+        </TransactionController>
+        <hashTree>
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="S01 GET トップ" enabled="true">
+            <stringProp name="TestPlan.comments">targets.json の path を叩く。埋め込みリソース (画像/CSS/JS) も一緒に取りに行かせたい場合は image_parser を有効にする。</stringProp>
+            <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="ユーザー定義変数" enabled="true">
+              <collectionProp name="Arguments.arguments"/>
+            </elementProp>
+            <stringProp name="HTTPSampler.path">${TARGET_PATH}</stringProp>
+            <stringProp name="HTTPSampler.method">GET</stringProp>
+            <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+            <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+            <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+            <boolProp name="HTTPSampler.DO_MULTIPART_POST">false</boolProp>
+            <boolProp name="HTTPSampler.image_parser">false</boolProp>
+            <boolProp name="HTTPSampler.concurrentDwn">false</boolProp>
+          </HTTPSamplerProxy>
+          <hashTree>
+            <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="A01 応答コード 200" enabled="true">
+              <stringProp name="TestPlan.comments">アサーションが無いと「200 以外も成功」として集計され、エラー率が実態より良く出る。最低でも応答コードは必ず判定すること。</stringProp>
+              <collectionProp name="Asserion.test_strings">
+                <stringProp name="49586">200</stringProp>
+              </collectionProp>
+              <stringProp name="Assertion.custom_message">期待する応答コード 200 ではない</stringProp>
+              <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+              <boolProp name="Assertion.assume_success">false</boolProp>
+              <intProp name="Assertion.test_type">8</intProp>
+            </ResponseAssertion>
+            <hashTree/>
+            <DurationAssertion guiclass="DurationAssertionGui" testclass="DurationAssertion" testname="A02 SLA 2 秒以内 (任意 / 既定は無効)" enabled="false">
+              <stringProp name="TestPlan.comments">応答時間そのものを合否にしたいときに有効化する。SLA を超えたサンプルをエラーとして数えるため、エラー率がそのまま SLA 違反率になる。</stringProp>
+              <stringProp name="DurationAssertion.duration">2000</stringProp>
+            </DurationAssertion>
+            <hashTree/>
+          </hashTree>
+        </hashTree>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="TM01 ThinkTime (一様乱数)" enabled="true">
+          <stringProp name="TestPlan.comments">待ち時間 = 固定値 + 0〜ランダム幅。人の操作間隔を模す。これを 0 にすると 1 スレッドが休みなく投げ続ける「限界性能測定」になり、同じスレッド数でも負荷が桁違いに上がる。</stringProp>
+          <stringProp name="ConstantTimer.delay">${THINK_TIME_BASE}</stringProp>
+          <stringProp name="RandomTimer.range">${THINK_TIME_RANGE}</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <ConstantThroughputTimer guiclass="TestBeanGUI" testclass="ConstantThroughputTimer" testname="TM02 スループット固定 (任意 / 既定は無効)" enabled="false">
+          <stringProp name="TestPlan.comments">「毎分 600 リクエスト」のように流量を固定したいとき (= 本番の実測 TPS を再現したいとき) に有効化する。calcMode=2 はスレッドグループ内の全スレッドで合計値を按分する設定。上限を絞る方向にしか効かない (スレッド数が足りなければ目標に届かない)。</stringProp>
+          <intProp name="calcMode">2</intProp>
+          <doubleProp>
+            <name>throughput</name>
+            <value>600.0</value>
+            <savedValue>0.0</savedValue>
+          </doubleProp>
+        </ConstantThroughputTimer>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

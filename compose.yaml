@@ -65,6 +65,13 @@
 #                               実物と同じコマンド体系で frontend / backend の
 #                               中に入り、ファイルの投入・取り出しもできる
 #                               (チャネルの実体は SSM ではなく docker exec)
+#   jmeter                    → 性能試験 (Apache JMeter) の実行コンテナ。
+#                               GUI で作った .jmx を compose/jmeter/test-plans/ へ
+#                               置くと、非 GUI モードで実行して frontend (既定) へ
+#                               負荷をかけ、GUI で開ける結果 (jtl) と HTML
+#                               ダッシュボードを compose/jmeter/results/ へ出す。
+#                               profiles: loadtest のため通常の up では起動しない
+#                               (docs/JMETER-LOADTEST.md)
 #
 # ECS では同一タスク内 localhost 通信だが、compose では各サービスが別ネットワーク
 # 名前空間のため、宛先を環境変数 (OTEL_EXPORTER_OTLP_ENDPOINT / BACK_BASE_URL 等)
@@ -1144,6 +1151,106 @@ services:
       timeout: 10s
       retries: 3
       start_period: 5s
+
+  # --- 性能試験 (Apache JMeter) ------------------------------------------------
+  # GUI で作った .jmx を非 GUI モードで実行し、GUI で開ける結果 (jtl) と
+  # HTML ダッシュボードを出す。負荷をかける相手は既定で frontend。
+  #
+  # 通常の `docker compose up` では起動しない (profiles: loadtest)。
+  # 常駐サービスではなく「実行するたびに起動して終わるジョブ」なので、
+  # tls-verifier と同じく docker compose run で使う:
+  #
+  #   # 1) 手元の JMeter GUI で作った .jmx を compose/jmeter/test-plans/ へ置く
+  #   # 2) 実行 (対象の既定は frontend)
+  #   docker compose --profile loadtest run --rm jmeter run sample-frontend.jmx
+  #   # 3) 結果は compose/jmeter/results/<日時>_<計画名>_<対象>/ に出る
+  #   #    result.jtl        … JMeter GUI のリスナーで開く
+  #   #    report/index.html … HTML ダッシュボード (ブラウザで開く)
+  #
+  #   docker compose --profile loadtest run --rm jmeter list      # 置いてある .jmx
+  #   docker compose --profile loadtest run --rm jmeter targets   # 投げ先の一覧
+  #   docker compose --profile loadtest run --rm jmeter doctor    # 自己診断 + 到達確認
+  #   docker compose --profile loadtest run --rm -e JMETER_TARGET=backend \
+  #     -e JMETER_THREADS=50 -e JMETER_DURATION=600 jmeter run
+  #
+  # ★負荷条件 (スレッド数 / ramp-up / 試験時間 / ThinkTime) は下の environment、
+  #   投げ先は compose/jmeter/targets.json、JMeter 自体の設定は
+  #   compose/jmeter/user.properties で差し替える。
+  #   各設定の意味と推奨値: docs/JMETER-LOADTEST.md / docs/JMETER-SETTINGS.xlsx
+  #
+  # depends_on を付けていないのは、投げ先を frontend / backend / alb / secure-api
+  # から選べるようにしているため (使わないサービスまで起動させない)。
+  # 代わりに実行前に対象への到達確認を 1 回行い、届かなければ試験を開始しない。
+  jmeter:
+    build:
+      context: ./compose/jmeter
+      dockerfile: Dockerfile
+      args:
+        # ★手元の JMeter GUI と同じバージョンにそろえること
+        JMETER_VERSION: ${JMETER_VERSION:-5.6.3}
+    container_name: jmeter
+    profiles: ["loadtest"]
+    environment:
+      # --- 投げ先 -----------------------------------------------------------
+      # targets.json のキー名 (frontend / backend / alb / alb-https / secure-api ...)
+      JMETER_TARGET: ${JMETER_TARGET:-frontend}
+      # 実行するテスト計画 (空なら引数 → test-plans/ に 1 つだけあればそれ → 同梱サンプル)
+      JMETER_PLAN: ${JMETER_PLAN:-}
+      # --- 負荷条件 (未設定ならテスト計画側の既定値を使う) --------------------
+      # 同時実行ユーザ数 (スレッド数)。1 コンテナあたり 200〜300 が目安
+      JMETER_THREADS: ${JMETER_THREADS:-10}
+      # 全スレッドを起動しきるまでの秒数。最低でもスレッド数と同じ秒数を推奨
+      JMETER_RAMPUP: ${JMETER_RAMPUP:-10}
+      # 試験時間 (秒)。ramp-up + 定常状態を含む
+      JMETER_DURATION: ${JMETER_DURATION:-300}
+      # ループ回数。-1 = 試験時間で終わるまで無限に回す
+      JMETER_LOOPS: "${JMETER_LOOPS:--1}"
+      # 操作間の待ち時間 (ミリ秒)。base + 0〜range のランダム。0 で限界性能測定
+      JMETER_THINK_TIME_BASE: ${JMETER_THINK_TIME_BASE:-500}
+      JMETER_THINK_TIME_RANGE: ${JMETER_THINK_TIME_RANGE:-1000}
+      # 接続 / 応答タイムアウト (ミリ秒)。0 (無制限) にしないこと
+      JMETER_CONNECT_TIMEOUT: ${JMETER_CONNECT_TIMEOUT:-5000}
+      JMETER_RESPONSE_TIMEOUT: ${JMETER_RESPONSE_TIMEOUT:-30000}
+      # --- 結果の出し方 ------------------------------------------------------
+      # csv … 既定。GUI のリスナーでも HTML レポートでも読める
+      # xml … 応答本文まで残せるが肥大化し、HTML レポートは生成できない
+      JMETER_RESULTS_FORMAT: ${JMETER_RESULTS_FORMAT:-csv}
+      # 応答本文を保存するか (xml のときだけ意味がある。試験本番では false)
+      JMETER_SAVE_RESPONSE_DATA: ${JMETER_SAVE_RESPONSE_DATA:-false}
+      # HTML ダッシュボード (report/index.html) を生成するか
+      JMETER_GENERATE_REPORT: ${JMETER_GENERATE_REPORT:-true}
+      # エラー率の上限 (%)。超えると終了コード 2 (CI から回すときの合否判定用)。
+      # 空なら判定しない
+      JMETER_MAX_ERROR_RATE: ${JMETER_MAX_ERROR_RATE:-}
+      # --- JVM ---------------------------------------------------------------
+      # 負荷生成側のヒープ。スレッド数を増やすときは一緒に上げる
+      # (目安: 200 スレッドで 1g、500 スレッドで 2g)
+      JMETER_HEAP: "${JMETER_HEAP:--Xms1g -Xmx1g -XX:MaxMetaspaceSize=256m}"
+      # --- 固定パス (コンテナ内) ---------------------------------------------
+      JMETER_PLANS_DIR: /test-plans
+      JMETER_RESULTS_DIR: /results
+      JMETER_TARGETS_FILE: /etc/jmeter/targets.json
+      JMETER_USER_PROPERTIES: /etc/jmeter/user.properties
+      JMETER_LIB_EXT: /opt/jmeter-lib-ext
+      # HTTPS 対象 (alb-https / secure-api) を測るときに取り込む自己証明書。
+      # front/back の entrypoint と同じ /mnt/pki/trust を見る
+      JMETER_TRUST_DIR: /mnt/pki/trust
+      # 結果ファイルの時刻表示を JST にそろえる (jtl の timeStamp 自体は epoch ms)
+      TZ: ${TZ:-Asia/Tokyo}
+    volumes:
+      # ★GUI で作った .jmx の置き場 (読み取り専用)
+      - ./compose/jmeter/test-plans:/test-plans:ro
+      # ★結果の出力先 (jtl / jmeter.log / HTML レポート)。ここを GUI から開く
+      - ./compose/jmeter/results:/results
+      # 追加プラグイン jar を入れたいときの置き場 (任意)
+      - ./compose/jmeter/lib-ext:/opt/jmeter-lib-ext:ro
+      # 実行ラッパーと JMeter 自体の設定、投げ先定義。
+      # いずれもホスト側を直すだけで次の実行から反映される (イメージの再ビルド不要)
+      - ./compose/jmeter/jmeter-run.sh:/opt/jmeter-run/jmeter-run.sh:ro
+      - ./compose/jmeter/user.properties:/etc/jmeter/user.properties:ro
+      - ./compose/jmeter/targets.json:/etc/jmeter/targets.json:ro
+      # 自己証明書 (pki-init が発行)。HTTPS 対象を測るときに使う
+      - pki:/mnt/pki:ro
 
 volumes:
   mysql-data:

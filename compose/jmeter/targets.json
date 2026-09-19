@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "★差し替え可能★ JMeter の負荷をかける対象サービスの定義。",
+    "compose のサービス名がそのままコンテナ間のホスト名になるため、実質は",
+    "「ポートと既定パスの早見表」。jmeter-run が選ばれた対象の値を",
+    "-Jtarget.protocol / -Jtarget.host / -Jtarget.port / -Jtarget.path として",
+    "JMeter へ渡し、テスト計画側は ${__P(target.host,frontend)} 等で受け取る。",
+    "default を変えれば、対象を指定しなかったときの既定の投げ先が変わる。"
+  ],
+  "default": "frontend",
+  "targets": {
+    "frontend": {
+      "protocol": "http",
+      "host": "frontend",
+      "port": 8080,
+      "path": "/",
+      "note": "既定の対象。ECS の app-front コンテナ (JBoss EAP 8080) に対応"
+    },
+    "backend": {
+      "protocol": "http",
+      "host": "backend",
+      "port": 8180,
+      "path": "/",
+      "note": "ECS の app-back (port-offset 100 のため 8180)"
+    },
+    "alb": {
+      "protocol": "http",
+      "host": "alb",
+      "port": 80,
+      "path": "/",
+      "note": "ALB (nginx) 経由。リスナールール込みの経路を測る"
+    },
+    "alb-https": {
+      "protocol": "https",
+      "host": "alb",
+      "port": 443,
+      "path": "/secure/v1/ping",
+      "note": "ALB の HTTPS リスナー。cacert.crt を JMeter のトラストストアへ取り込んで呼ぶ"
+    },
+    "secure-api": {
+      "protocol": "https",
+      "host": "secure-api",
+      "port": 8443,
+      "path": "/api/v1/ping",
+      "note": "HTTPS 専用の外部 API 相当 (WireMock)。TLS ハンドシェイクの負荷を見る"
+    },
+    "svf-mock": {
+      "protocol": "http",
+      "host": "svf-mock",
+      "port": 8080,
+      "path": "/__admin/health",
+      "note": "帳票サーバ相当 (WireMock)。EAP 不要で動くため配管の動作確認に使える。帳票 API 自体は POST /api/reports"
+    },
+    "alb-healthcheck": {
+      "protocol": "http",
+      "host": "alb-healthcheck",
+      "port": 8580,
+      "path": "/targets",
+      "note": "負荷中にターゲットの health 状態を参照する用 (負荷対象ではない)"
+    }
+  }
+}
