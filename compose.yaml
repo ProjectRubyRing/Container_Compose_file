@@ -10,6 +10,12 @@
 #                               frontend / backend を ELB-HealthChecker/2.0 として定期的に
 #                               呼び、ステータスコードと matcher 判定・連続回数から
 #                               initial / healthy / unhealthy を導出する
+#   alb-front                 → frontend の前段にある ALB (HTTPS リスナー → HTTP
+#                               ターゲットグループ) の代替。TLS を終端して frontend:8080 へ
+#                               HTTP で転送し、X-Forwarded-For / X-Forwarded-Proto: https /
+#                               X-Forwarded-Port / X-Amzn-Trace-Id を ALB と同じ規則で付ける
+#                               (Location は書き換えない)。リダイレクトの Location が https で
+#                               返るかを区間ごとに確認するレポートを持つ
 #   adot-collector            → 同じ ADOT Collector イメージ。exporter だけ
 #                               awsxray → debug + otlphttp(Jaeger) に差し替え
 #   jaeger                    → X-Ray コンソールの代替 (トレース可視化 UI)
@@ -860,6 +866,73 @@ services:
     healthcheck:
       # 偽装サービス自身が生きているか (ターゲットの健全性とは無関係)
       test: ["CMD-SHELL", "python3 /opt/alb-healthcheck/healthcheck.py ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # --- frontend 向け ALB の偽装 (HTTPS リスナー → HTTP ターゲットグループ) ----
+  # 実 AWS: ブラウザ ──HTTPS──▶ ALB:443 (TLS 終端) ──HTTP──▶ app-front:8080 (JBoss EAP)
+  # ALB はターゲットへの要求に X-Forwarded-For (追記) / X-Forwarded-Proto: https /
+  # X-Forwarded-Port / X-Amzn-Trace-Id を付け、Host は透過し、ターゲットの応答
+  # (★Location を含む★) は書き換えずに返す。このサービスはその転送を同じ規則で再現する
+  # (上の alb (nginx) は backend / secure-api 向けで、frontend の前段は持っていない)。
+  #
+  # 目的: ALB → JBoss EAP が HTTP でも、リダイレクトの Location が https で返るか
+  #       (JBoss EAP が X-Forwarded-Proto を反映しているか) を確認する。
+  #       JBoss EAP 側の設定は http-listener の proxy-address-forwarding=true。
+  #
+  #   curl -sk -D - -o /dev/null https://localhost:8443/iwinmichl/api/redirect-check/redirect
+  #   docker compose exec alb-front python3 /opt/alb-front/alb-front.py report   # 区間ごとのレポート
+  #   docker compose logs -f alb-front                                           # ALB のアクセスログ相当
+  #   curl -s http://localhost:8581/exchanges                                    # 転送記録 (JSON)
+  #   ./verify-alb-front.sh                                                      # 上記をまとめて実行
+  # build_and_verify.sh --keep-container-mode logs で alb-front を選ぶと
+  # 「Location ヘッダ確認」から同じレポートを画面へ出せる。詳細は docs/ALB-FRONT-LOCATION.md。
+  #
+  # ★リスナーのポートはホストへ公開するポートと同じ番号にする (既定 8443)。
+  #   X-Forwarded-Port (= JBoss EAP が Location に入れるポート) と、クライアントが
+  #   実際に使ったポートを一致させるため。変える場合は .env の ALB_FRONT_HTTPS_PORT だけを直す。
+  alb-front:
+    image: python:3.12-slim
+    container_name: alb-front
+    command: ["python3", "/opt/alb-front/alb-front.py", "serve"]
+    environment:
+      ALB_FRONT_HTTPS_PORT: "${ALB_FRONT_HTTPS_PORT:-8443}"
+      ALB_FRONT_ADMIN_PORT: "8081"
+      # ターゲットグループ (プロトコル = HTTP)。frontend の http-listener (8080)
+      ALB_FRONT_TARGET: http://frontend:8080
+      # HTTPS リスナーの証明書 (ACM 証明書相当)。pki-init が発行した ALB 用 (CA 発行)。
+      # SAN に localhost を含むため、report はホスト名検証付きで接続できる
+      ALB_FRONT_TLS_CERT: /pki/alb/ca-issued/fullchain.crt
+      ALB_FRONT_TLS_KEY: /pki/alb/ca-issued/server.key
+      ALB_FRONT_CA_BUNDLE: /pki/ca/verify-bundle.crt
+      # report (Location ヘッダ確認) の既定値。build_and_verify.sh のダイアログもこの値を既定にする
+      ALB_FRONT_CHECK_HOST: localhost
+      ALB_FRONT_CHECK_PATH: /iwinmichl/api/redirect-check/redirect
+      # ALB のアイドルタイムアウト (既定 60 秒) / ターゲット接続タイムアウト (10 秒)
+      ALB_FRONT_IDLE_TIMEOUT: "60"
+      ALB_FRONT_CONNECT_TIMEOUT: "10"
+      # 偽装サービスのコンテナ内 CLI の場所。build_and_verify.sh の
+      # 「Location ヘッダ確認」メニューがこの値を見て docker exec する。
+      ALB_FRONT_CLI: /opt/alb-front/alb-front.py
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./compose/alb-front/alb-front.py:/opt/alb-front/alb-front.py:ro
+      - pki:/pki:ro                                      # 証明書の実体 (pki-init が発行)
+    ports:
+      - "${ALB_FRONT_HTTPS_PORT:-8443}:${ALB_FRONT_HTTPS_PORT:-8443}"   # HTTPS リスナー
+      - "${ALB_FRONT_ADMIN_HOST_PORT:-8581}:8081"                       # 転送記録 API
+    depends_on:
+      # 証明書が無いと HTTPS リスナーを開けないため、発行完了を待つ
+      pki-init:
+        condition: service_healthy
+      # ALB はターゲットの起動完了を待たない (届かない間は 502 / 503 を返す)
+      frontend:
+        condition: service_started
+    healthcheck:
+      # 偽装サービス自身が生きているか (管理 API の応答と HTTPS リスナーの TLS 受付)
+      test: ["CMD", "python3", "/opt/alb-front/alb-front.py", "ready"]
       interval: 10s
       timeout: 5s
       retries: 5

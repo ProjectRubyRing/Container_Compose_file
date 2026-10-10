@@ -5,6 +5,9 @@
 # (pki-init が生成するテスト用証明書。コミットしない)
 .pki-out/
 
+# verify-alb-front.sh が保存する Location ヘッダ確認レポート (実行のたびに増える)
+.alb-front-reports/
+
 # 受領済み自己証明書の投入口。連携された cacert.crt / 秘密鍵はコミットしない
 # (README.md と .gitkeep だけを管理対象にする)
 compose/pki/provided/*

@@ -405,6 +405,22 @@ XID 長超過 (`node-identifier` / `TX_NODE_ID` が長すぎる場合) は XAER_
 
 詳細は [docs/ALB-HEALTHCHECK.md](docs/ALB-HEALTHCHECK.md) を参照。
 
+### ALB 経由でリダイレクトの Location が http になる (alb-front)
+
+ALB は TLS を終端して JBoss EAP へ HTTP で転送し、元の scheme を `X-Forwarded-Proto: https` で
+伝える。JBoss EAP (Undertow) は `sendRedirect(相対パス)` を request の scheme で絶対 URL に
+するため、http-listener の `proxy-address-forwarding` が `false` (既定) だと `Location: http://…` になる。
+ローカルでは `alb-front` が ALB の転送を同じ規則で再現する。
+
+| 症状 | 原因と対処 |
+|---|---|
+| `alb-front` のレポートが NG、[3] の `request.getScheme()` が `http` | ヘッダは届いているが JBoss EAP が読んでいない。`/subsystem=undertow/server=default-server/http-listener=default:write-attribute(name=proxy-address-forwarding,value=true)` → reload。8080 へは ALB からしか届かないよう SG で制限すること |
+| [4] は https なのに [6] (コンテキストルート) が http | アプリ側 (Spring の `ForwardedHeaderFilter` 等) だけで補正している。JBoss EAP 自身のリダイレクト (FORM 認証など) は http のまま。JBoss EAP 側で設定する |
+| `secure=true` にしたのに直らない | `secure` は `isSecure()` を true にするだけで scheme は変えない。`proxy-address-forwarding` を使う |
+| Location のポートがずれる | `X-Forwarded-Port` と実際のポートの不一致。ローカルでは `ALB_FRONT_HTTPS_PORT` で待ち受けと公開を同じ番号にする |
+
+詳細は [docs/ALB-FRONT-LOCATION.md](docs/ALB-FRONT-LOCATION.md) を参照。
+
 ### ECS Exec 関連 (ecs-exec / aws ecs execute-command)
 
 | 症状 | 原因と対処 |

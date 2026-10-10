@@ -9,6 +9,7 @@ compose.yaml                         # ローカル検証用 compose (Jaeger を
 compose.build-secret.yaml            # ★オーバーレイ: cacert.crt を build secret で front/back のビルドへ渡す
 DESIGN.md                            # 設計判断の根拠・デプロイ手順・トラブルシューティング
 docs/ALB-HEALTHCHECK.md              # ALB ターゲットグループのヘルスチェック偽装 (ステータスコード/成功失敗判定) の詳細ガイド
+docs/ALB-FRONT-LOCATION.md           # frontend 向け ALB の偽装 (HTTPS→HTTP) と Location ヘッダ確認の詳細ガイド
 docs/ECS-EXEC.md                     # ECS Exec 偽装 (aws ecs execute-command / ファイル投入) の詳細ガイド
 docs/ASYNC-SQS-LAMBDA-ALB.md         # 非同期チェーン (SQS→Lambda→ALB→backend) 詳細ガイド
 docs/CWAGENT-SSM-CONFIG.md           # CW_CONFIG_CONTENT / CW_CONFIG_CONTENT_MID による設定注入の詳細ガイド
@@ -26,6 +27,7 @@ verify-async.sh                      # 非同期チェーンの動作確認ス�
 verify-tls.sh                        # 自己署名証明書 HTTPS 経路の動作確認スクリプト
 verify-cwagent-ssm.sh                # cwagent の SSM (SecureString) 設定注入の動作確認スクリプト
 verify-ecs-exec.sh                   # ECS Exec 偽装 (接続・コマンド実行・ファイル往復・失敗系) の動作確認スクリプト
+verify-alb-front.sh                  # 偽装 ALB (alb-front) 経由で Location が https で返るかの確認スクリプト
 alb-maintenance.sh                   # ALB 全面メンテナンスモードの ON/OFF 切り替え
 alb-tls-cert.sh                      # ALB HTTPS リスナーの証明書切り替え (自己署名 / 中間CA発行)
 pki-export.sh                        # ★配備した cacert.crt の取り出しと配置 (build secret 用 / provided へ固定)
@@ -49,6 +51,7 @@ compose/
   alb/tls/                           # HTTPS リスナーに適用する証明書 (★差し替え可能★, variants/ あり)
   alb-healthcheck/healthcheck.py     # ALB ターゲットグループのヘルスチェック偽装 (ELB-HealthChecker/2.0)
   alb-healthcheck/targets.json       # 同 ヘルスチェック設定 (★差し替え可能★, path/matcher/interval/threshold)
+  alb-front/alb-front.py             # frontend 向け ALB の偽装 (HTTPS 終端→HTTP 転送 / X-Forwarded-* 付与 / Location 確認レポート)
   batch-mock/efs-propagation.sh      # 偽装バッチサーバー (同じ EFS へファイル/相対シンボリックリンクを作成・書換・削除)
   batch-mock/README.md               # 同 解説 (uid:gid 6301:6302 / setgid / 相対リンクにする理由)
   ecs-exec/ecs-exec.py, Dockerfile   # ECS Exec 偽装 (aws ecs execute-command 互換 + ファイル投入/取り出し)
@@ -164,6 +167,38 @@ docker compose exec alb-healthcheck \
   **ALB ヘルスチェック確認 (ステータスコード / 成功失敗判定)** が追加される
 
 **実装・設定方法の詳細は [docs/ALB-HEALTHCHECK.md](docs/ALB-HEALTHCHECK.md) を参照。**
+
+## frontend 向け ALB の偽装と Location ヘッダ確認 (alb-front)
+
+本番は **ブラウザ → ALB が HTTPS、ALB → JBoss EAP が HTTP**。ALB は元の scheme を
+`X-Forwarded-Proto: https` で伝えるが、JBoss EAP がそれを反映していないと、アプリの
+リダイレクトの **`Location` が `http://...` になる**。`alb-front` サービスは ALB の
+「HTTPS リスナー → HTTP ターゲットグループ」の転送を同じ規則で再現する
+(TLS 終端 / `X-Forwarded-For` 追記 / `X-Forwarded-Proto: https` / `X-Forwarded-Port` /
+`X-Amzn-Trace-Id` / Host は透過 / **Location は書き換えない**)。
+
+```bash
+# ホストから https で呼び、Location を見る (確認用 API は別リポジトリ dhapp_2 の /api/redirect-check)
+curl -sk -D - -o /dev/null https://localhost:8443/iwinmichl/api/redirect-check/redirect
+
+# クライアント ─https─▶ alb-front ─http─▶ frontend → Location の区間ごとのレポート
+docker compose exec alb-front python3 /opt/alb-front/alb-front.py report
+./verify-alb-front.sh                       # 上の 2 つをまとめて実行しレポートを保存
+docker compose logs -f alb-front            # ALB のアクセスログ相当
+curl -s http://localhost:8581/exchanges     # 転送記録 (ALB がターゲットへ送ったヘッダ)
+```
+
+- レポートは「[1] クライアント → ALB が https」「[2] ALB → frontend が http と付与したヘッダ」
+  「[3] JBoss EAP が受け取ったヘッダと認識した scheme」「[4] 返った Location (ALB は書き換えない)」
+  「[5] ヘッダ無しで直接呼んだ対照実験」「[6] JBoss EAP 自身のリダイレクト」を並べて判定する
+- NG のときは JBoss EAP の http-listener の `proxy-address-forwarding=true` で直る
+  (レポートに対処コマンドが出る。ローカルの frontend はコンテナ内の jboss-cli で試せる)
+- `build_and_verify.sh --keep-container-mode logs` で `alb-front` を選ぶと
+  **Location ヘッダ確認** が操作メニューに追加される
+- ポートは HTTPS `:8443` (待ち受けと公開を同じ番号にする。変更は `.env` の `ALB_FRONT_HTTPS_PORT`) /
+  転送記録 API `:8581`
+
+**実装・設定方法の詳細は [docs/ALB-FRONT-LOCATION.md](docs/ALB-FRONT-LOCATION.md) を参照。**
 
 ## ECS Exec の偽装 (frontend / backend の中へ入る・ファイルを送り込む)
 
